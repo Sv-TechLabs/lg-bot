@@ -513,6 +513,8 @@ class LGBot:
     def parse_inventory(self, tree: html.HtmlElement) -> list[dict]:
         table = tree.xpath(f'//table[@id="{LGBot.GRID_ID}"]')
         if not table:
+            all_tables = tree.xpath('//table/@id')
+            _log("scan", f"Grid '{LGBot.GRID_ID}' not found. Tables on page: {all_tables[:10]}")
             return []
         rows = table[0].xpath('.//tr[position()>1]')
         inventory = []
