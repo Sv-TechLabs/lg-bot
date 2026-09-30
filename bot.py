@@ -163,6 +163,7 @@ class LGBot:
         self._cached_inventory: list[dict] = []
         self._cached_page1_serials: set[str] = set()
         self._last_full_scan_iter = 0
+        self._current_page_arg: str | None = None
 
     def fetch_config(self) -> None:
         if not self.api_url or not self.filter_id:
@@ -332,17 +333,31 @@ class LGBot:
         filtered = []
         for r in inventory:
             # Serial number exact-match filter (when list is non-empty, only match those serials)
-            if self.serial_numbers and r["serial_no"] not in self.serial_numbers:
+            if self.serial_numbers:
+                if r["serial_no"] not in self.serial_numbers:
+                    continue
+                # Explicit serial requested: only check price if an actual price is rendered on portal
+                raw_p = (r.get("dealer_price") or r.get("base_price") or "").strip()
+                if self.filter_by_price and raw_p:
+                    p = price(raw_p)
+                    if self.min_price is not None and p < self.min_price:
+                        _log("scan", f"Reject {r['serial_no'][:15]}: price ₹{raw_p} < min ₹{self.min_price}")
+                        continue
+                    if self.max_price is not None and p > self.max_price:
+                        _log("scan", f"Reject {r['serial_no'][:15]}: price ₹{raw_p} > max ₹{self.max_price}")
+                        continue
+                filtered.append(r)
                 continue
 
             # Price filter (only when toggled ON)
             if self.filter_by_price:
-                p = price(r["dealer_price"])
+                raw_p = (r.get("dealer_price") or r.get("base_price") or "").strip()
+                p = price(raw_p)
                 if self.min_price is not None and p < self.min_price:
-                    _log("scan", f"Reject {r['serial_no'][:15]}: price ₹{r['dealer_price']} < min ₹{self.min_price}")
+                    _log("scan", f"Reject {r['serial_no'][:15]}: price ₹{raw_p} < min ₹{self.min_price}")
                     continue
                 if self.max_price is not None and p > self.max_price:
-                    _log("scan", f"Reject {r['serial_no'][:15]}: price ₹{r['dealer_price']} > max ₹{self.max_price}")
+                    _log("scan", f"Reject {r['serial_no'][:15]}: price ₹{raw_p} > max ₹{self.max_price}")
                     continue
 
             # Discount % filter (only when toggled ON)
@@ -430,6 +445,7 @@ class LGBot:
         self._parse_dropdowns(tree)
         st = tree.xpath('//*[@id="txtcode"]/@value')
         self.ship_to = st[0] if st else ""
+        self._current_page_arg = None
         return tree
 
     def search(self) -> html.HtmlElement | None:
@@ -591,6 +607,7 @@ class LGBot:
         except Exception:
             return None
         self._extract_hidden(tree)
+        self._current_page_arg = page_arg
         return tree
 
     def collect_pages(self, tree: html.HtmlElement) -> list[tuple[str | None, list[dict]]]:
@@ -602,9 +619,17 @@ class LGBot:
         submitting (each page's checkboxes only exist in that page's viewstate).
         """
         current, page_args, labels = self.parse_pager(tree)
-        _log("scan", f"Grid page {current} | {len(self.parse_inventory(tree))} item(s) on current page")
+        page1_rows = self.parse_inventory(tree)
+        _log("scan", f"Grid page {current} | {len(page1_rows)} item(s) on current page")
         initial_arg = None if not page_args else self._derive_page_arg(current, labels)
-        pages: list[tuple[str | None, list[dict]]] = [(initial_arg, self.parse_inventory(tree))]
+        self._current_page_arg = initial_arg
+        pages: list[tuple[str | None, list[dict]]] = [(initial_arg, page1_rows)]
+
+        # ── LATENCY OPT: Early exit if any target serial is on page 1 (saves ~6s)
+        if self.serial_numbers and any(r["serial_no"] in self.serial_numbers for r in page1_rows):
+            _log("scan", "Target serial found on page 1 — stopping pagination immediately")
+            return pages
+
         seen: set[str] = {initial_arg}
         pending = [a for a in page_args if a != initial_arg]
         while pending:
@@ -619,6 +644,12 @@ class LGBot:
             rows = self.parse_inventory(tree2)
             _log("scan", f"Grid page {arg}: {len(rows)} item(s)")
             pages.append((arg, rows))
+
+            # ── LATENCY OPT: Early exit if any target serial is on this page
+            if self.serial_numbers and any(r["serial_no"] in self.serial_numbers for r in rows):
+                _log("scan", f"Target serial found on grid page {arg} — stopping pagination immediately")
+                return pages
+
             _, more_args, more_labels = self.parse_pager(tree2)
             for a in more_args:
                 if a not in seen and a not in pending:
@@ -954,7 +985,7 @@ class LGBot:
             page_matched = [r for r in rows if r["serial_no"] in matched_serials]
             if not page_matched:
                 continue
-            if page_arg is not None:
+            if page_arg is not None and page_arg != getattr(self, "_current_page_arg", None):
                 tree_pg = self._fetch_page(page_arg)
                 if tree_pg is None:
                     _log("warn", f"Failed to re-open grid page {page_arg} for submit")
