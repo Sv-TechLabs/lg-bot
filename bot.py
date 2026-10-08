@@ -625,10 +625,19 @@ class LGBot:
         self._current_page_arg = initial_arg
         pages: list[tuple[str | None, list[dict]]] = [(initial_arg, page1_rows)]
 
-        # ── LATENCY OPT: Early exit if any target serial is on page 1 (saves ~6s)
-        if self.serial_numbers and any(r["serial_no"] in self.serial_numbers for r in page1_rows):
-            _log("scan", "Target serial found on page 1 — stopping pagination immediately")
-            return pages
+        # ── LATENCY OPT: Early exit only when ALL target serials have been found.
+        # We track which serials are still missing and stop as soon as the set is
+        # exhausted.  Stopping on the *first* hit was wrong for lists of serials —
+        # the rest would never be scanned on subsequent pages.
+        if self.serial_numbers:
+            found_serials = {r["serial_no"] for r in page1_rows if r["serial_no"] in self.serial_numbers}
+            remaining = self.serial_numbers - found_serials
+            if not remaining:
+                _log("scan", "All target serials found on page 1 — stopping pagination immediately")
+                return pages
+            _log("scan", f"Page 1: {len(found_serials)}/{len(self.serial_numbers)} target serial(s) found, continuing pagination for remaining {len(remaining)}")
+        else:
+            remaining = set()
 
         seen: set[str] = {initial_arg}
         pending = [a for a in page_args if a != initial_arg]
@@ -645,10 +654,15 @@ class LGBot:
             _log("scan", f"Grid page {arg}: {len(rows)} item(s)")
             pages.append((arg, rows))
 
-            # ── LATENCY OPT: Early exit if any target serial is on this page
-            if self.serial_numbers and any(r["serial_no"] in self.serial_numbers for r in rows):
-                _log("scan", f"Target serial found on grid page {arg} — stopping pagination immediately")
-                return pages
+            # ── LATENCY OPT: Early exit only when every remaining serial is accounted for
+            if self.serial_numbers:
+                found_here = {r["serial_no"] for r in rows if r["serial_no"] in remaining}
+                remaining -= found_here
+                if not remaining:
+                    _log("scan", f"All target serials found — stopping pagination after page {arg}")
+                    return pages
+                if found_here:
+                    _log("scan", f"Page {arg}: found {len(found_here)} more serial(s), still missing {len(remaining)}")
 
             _, more_args, more_labels = self.parse_pager(tree2)
             for a in more_args:
