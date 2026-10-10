@@ -26,7 +26,7 @@ OTP_TIMEOUT = float(os.environ.get("OTP_TIMEOUT_S", "90"))
 OTP_POLL_INTERVAL = max(0.1, float(os.environ.get("OTP_POLL_INTERVAL_S", "0.25")))
 # When set, the bot prints the exact data it would send to SaveBiddingData
 # (including image URLs) instead of actually submitting the bid.
-DRY_RUN = True
+DRY_RUN = os.environ.get("BOT_DRY_RUN", "0") == "1"
 # Re-run a full multi-page grid scan at least this often, even if page 1
 # hasn't changed (catches items added on later pages).
 FULL_SCAN_EVERY = int(os.environ.get("FULL_SCAN_EVERY", "20"))
