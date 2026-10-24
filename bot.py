@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import httpx
-from lxml import html
+from lxml import etree, html
 
 try:
     from websockets.sync.client import connect as ws_connect
@@ -23,7 +23,7 @@ except ImportError:
 
 
 OTP_TIMEOUT = float(os.environ.get("OTP_TIMEOUT_S", "90"))
-OTP_POLL_INTERVAL = max(0.05, float(os.environ.get("OTP_POLL_INTERVAL_S", "0.1")))
+OTP_POLL_INTERVAL = max(0.01, float(os.environ.get("OTP_POLL_INTERVAL_S", "0.01")))
 # When set, the bot prints the exact data it would send to SaveBiddingData
 # (including image URLs) instead of actually submitting the bid.
 DRY_RUN = os.environ.get("BOT_DRY_RUN", "0") == "1"
@@ -107,6 +107,16 @@ class LGBot:
             except Exception:
                 pass
 
+        limits = httpx.Limits(
+            max_keepalive_connections=30,
+            max_connections=100,
+            keepalive_expiry=60.0,
+        )
+        transport = httpx.HTTPTransport(
+            http2=True,
+            limits=limits,
+            local_address="0.0.0.0",
+        )
         self.sess = httpx.Client(
             http2=True,
             headers={
@@ -124,10 +134,9 @@ class LGBot:
             },
             follow_redirects=True,
             timeout=60.0,
-            transport=httpx.HTTPTransport(
-                local_address="0.0.0.0",
-            ),
+            transport=transport,
         )
+        self._pool = ThreadPoolExecutor(max_workers=8)
         self.viewstate: str | None = None
         self.eventvalidation: str | None = None
         self.generator: str = "95C5CE92"
@@ -148,8 +157,14 @@ class LGBot:
         self.dp_percents: set[float] = set()
         self.filter_by_price: bool = True
         self.filter_by_dp: bool = True
+        self.filter_by_product: bool = False
+        self.product_mode: str = "include"
+        self.products: set[str] = set()
         self.serial_numbers: set[str] = set()
-        self.scan_interval: float = 2.0
+        self.scan_interval: float = 0.0
+        self.retry_count: int = 1
+        self.retry_backoff_s: float = 0.0
+        self.timeout_s: float = 5.0
         self.email: str = ""
         self.app_password: str = ""
         self._ws: _WSPusher | None = None
@@ -161,6 +176,7 @@ class LGBot:
         # Cached inventory from the last full multi-page scan, keyed by page-1
         # serial set, so we skip re-fetching every grid page each iteration.
         self._cached_inventory: list[dict] = []
+        self._cached_pages: list[tuple[str | None, list[dict]]] = []
         self._cached_page1_serials: set[str] = set()
         self._last_full_scan_iter = 0
         self._current_page_arg: str | None = None
@@ -184,18 +200,29 @@ class LGBot:
         self.dp_percents = set(c.get("dpPercents", []))
         self.filter_by_price = c.get("filterByPrice", True)
         self.filter_by_dp = c.get("filterByDp", True)
+        self.filter_by_product = bool(c.get("filterByProduct", False))
+        self.product_mode = str(c.get("productMode") or "include").strip().lower()
+        self.products = {
+            str(p).strip().upper() for p in c.get("products", []) if p and str(p).strip()
+        }
         self.serial_numbers = {
             str(s).strip().upper() for s in c.get("serialNumbers", []) if s and str(s).strip()
         }
-        self.scan_interval = max(0.5, c.get("scanInterval", 2000) / 1000.0)
+        self.scan_interval = max(0.0, float(c.get("scanInterval", 0)) / 1000.0)
+        self.retry_count = int(c.get("retryCount", 1))
+        self.retry_backoff_s = max(0.0, float(c.get("retryBackoffMs", 0)) / 1000.0)
+        if c.get("timeoutMs") and float(c.get("timeoutMs")) > 0:
+            self.timeout_s = max(1.0, float(c.get("timeoutMs")) / 1000.0)
         self.email = c.get("email", "")
         self.app_password = c.get("appPassword", "")
         _log("info", f"Profile: {c['name']} | URL: {self.url}")
         dp_str = " | ".join(f"{d}%" for d in sorted(self.dp_percents)) if self.dp_percents else "any"
         _log("info", f"Price: {'ON' if self.filter_by_price else 'OFF'} ₹{self.min_price}–₹{self.max_price} | DP: {'ON' if self.filter_by_dp else 'OFF'} {dp_str}")
+        prod_str = ", ".join(sorted(self.products)) if self.products else "none"
+        _log("info", f"Product: {'ON' if self.filter_by_product else 'OFF'} ({self.product_mode.upper()}: {prod_str})")
         if self.serial_numbers:
             _log("info", f"Serial filter: {len(self.serial_numbers)} serial(s) exact match: {list(self.serial_numbers)[:5]}")
-        _log("info", f"Scan: {self.scan_interval}s | Email: {self.email or 'none'}")
+        _log("info", f"Scan: {self.scan_interval}s | Retry: {self.retry_count} (backoff {self.retry_backoff_s}s) | Email: {self.email or 'none'}")
 
     def _send_kpi(self, response_time_ms: int) -> None:
         payload = {
@@ -281,8 +308,7 @@ class LGBot:
         """Report many bookings to the API concurrently (avoids N serial posts)."""
         if not self.api_url or not rows:
             return
-        with ThreadPoolExecutor(max_workers=min(32, len(rows))) as pool:
-            list(pool.map(self._report_booking, rows))
+        list(self._pool.map(self._report_booking, rows))
 
     def _submit_authorized(self, inventory: list[dict]) -> str:
         """Fast path: LG session is already OTP-authorized.
@@ -343,29 +369,39 @@ class LGBot:
         filtered = []
         for r in inventory:
             s_key = (r.get("serial_no") or "").strip().upper()
+            prod_key = (r.get("product") or "").strip().upper()
 
-            # Serial number exact-match filter (when list is non-empty, only match those serials)
-            if self.serial_numbers:
-                if s_key in self.serial_numbers:
-                    filtered.append(r)
+            # Serial number exact-match filter (must match if list is non-empty)
+            if self.serial_numbers and s_key not in self.serial_numbers:
                 continue
 
-            # Price filter (only when toggled ON and no serial list)
+            # Product filter (inclusive or exclusive)
+            if self.filter_by_product and self.products:
+                if self.product_mode == "exclude":
+                    if prod_key in self.products:
+                        _log("scan", f"Reject {r.get('serial_no', '')[:15]}: product '{prod_key}' excluded")
+                        continue
+                else:  # include
+                    if prod_key not in self.products:
+                        _log("scan", f"Reject {r.get('serial_no', '')[:15]}: product '{prod_key}' not in {self.products}")
+                        continue
+
+            # Price filter
             if self.filter_by_price:
                 raw_p = (r.get("dealer_price") or r.get("base_price") or "").strip()
                 p = price(raw_p)
                 if self.min_price is not None and p < self.min_price:
-                    _log("scan", f"Reject {r['serial_no'][:15]}: price ₹{raw_p} < min ₹{self.min_price}")
+                    _log("scan", f"Reject {r.get('serial_no', '')[:15]}: price ₹{raw_p} < min ₹{self.min_price}")
                     continue
                 if self.max_price is not None and p > self.max_price:
-                    _log("scan", f"Reject {r['serial_no'][:15]}: price ₹{raw_p} > max ₹{self.max_price}")
+                    _log("scan", f"Reject {r.get('serial_no', '')[:15]}: price ₹{raw_p} > max ₹{self.max_price}")
                     continue
 
-            # Discount % filter (only when toggled ON and no serial list)
+            # Discount % filter
             if self.filter_by_dp and self.dp_percents:
-                d = dp(r["dp"])
+                d = dp(r.get("dp", ""))
                 if d not in self.dp_percents:
-                    _log("scan", f"Reject {r['serial_no'][:15]}: DP {d}% not in {self.dp_percents}")
+                    _log("scan", f"Reject {r.get('serial_no', '')[:15]}: DP {d}% not in {self.dp_percents}")
                     continue
 
             filtered.append(r)
@@ -481,6 +517,28 @@ class LGBot:
     GRID_ID = "gvNGSIDetails"
     GRID_TARGET = "ctl00$ContentPlaceHolder1$gvNGSIDetails"
 
+    XP_TABLE = etree.XPath(f'//table[@id="{GRID_ID}"]')
+    XP_ROWS = etree.XPath('.//tr[position()>1]')
+    XP_CB = etree.XPath('.//input[@type="checkbox"]')
+    XP_FULL_IMG = etree.XPath('.//a[contains(@id, "lnkImgAttachment")]/@href | .//img/@src')
+    XP_DMG_IMG = etree.XPath('.//a[contains(@id, "lnkDmgImgAttachment")]/@href')
+
+    XP_BASE_PRICE = etree.XPath('string(.//*[contains(@id,"lblfulbaseprice")])')
+    XP_BATCHNO = etree.XPath('string(.//*[contains(@id,"lblbatchnum")])')
+    XP_IMAGE_NAME = etree.XPath('string(.//*[contains(@id,"lblImageName")])')
+    XP_DMG_IMAGE = etree.XPath('string(.//*[contains(@id,"lblDmgImg2Name")])')
+    XP_SRNO = etree.XPath('string(.//*[contains(@id,"lblsrno")])')
+    XP_MODEL_CODE = etree.XPath('string(.//*[contains(@id,"lblModelCode")])')
+    XP_PRODUCT = etree.XPath('string(.//*[contains(@id,"lblProduct")])')
+    XP_BRANCH = etree.XPath('string(.//*[contains(@id,"lblBranch")])')
+    XP_BILL_BRANCH = etree.XPath('string(.//*[contains(@id,"lblBill_Branch") or contains(@id,"lblBillBranch")])')
+    XP_CATEGORY = etree.XPath('string(.//*[contains(@id,"lblDiscCategory")])')
+    XP_FROM_DATE = etree.XPath('string(.//*[contains(@id,"lblfromdate")])')
+    XP_TO_DATE = etree.XPath('string(.//*[contains(@id,"lbltodate")])')
+    XP_DEALER_PRICE = etree.XPath('string(.//*[contains(@id,"lbldealerp")])')
+    XP_DP = etree.XPath('string(.//*[contains(@id,"lbldp")])')
+    XP_DEFECT = etree.XPath('string(.//*[contains(@id,"lbltypeofdefect")])')
+
     @staticmethod
     def parse_pager(tree: html.HtmlElement) -> tuple[int, list[str], dict[int, str]]:
         """Return (current_page, page_args, label_to_arg) from the grid's pager row.
@@ -536,25 +594,20 @@ class LGBot:
         return f"Page${current}"
 
     def parse_inventory(self, tree: html.HtmlElement) -> list[dict]:
-        table = tree.xpath(f'//table[@id="{LGBot.GRID_ID}"]')
+        table = LGBot.XP_TABLE(tree)
         if not table:
             all_tables = tree.xpath('//table/@id')
             _log("scan", f"Grid '{LGBot.GRID_ID}' not found. Tables on page: {all_tables[:10]}")
             return []
-        rows = table[0].xpath('.//tr[position()>1]')
+        rows = LGBot.XP_ROWS(table[0])
         inventory = []
         for tr in rows:
-            cb = tr.xpath('.//input[@type="checkbox"]')
+            cb = LGBot.XP_CB(tr)
             if not cb:
                 continue
 
-            def g(xp: str) -> str:
-                els = tr.xpath(xp)
-                return (els[0].text_content() or "").strip() if els else ""
-
-            # Check both attachment <a> links and <img> @src attributes.
-            full_img_href = tr.xpath('.//a[contains(@id, "lnkImgAttachment")]/@href | .//img/@src')
-            dmg_img_href = tr.xpath('.//a[contains(@id, "lnkDmgImgAttachment")]/@href')
+            full_img_href = LGBot.XP_FULL_IMG(tr)
+            dmg_img_href = LGBot.XP_DMG_IMG(tr)
 
             image_url = self._resolve_img(full_img_href[0]) if full_img_href else ""
             if dmg_img_href:
@@ -566,23 +619,23 @@ class LGBot:
 
             inventory.append({
                 "checkbox_name": cb[0].get("name"),
-                "base_price":    g('.//*[contains(@id,"lblfulbaseprice")]'),
-                "batchno":       g('.//*[contains(@id,"lblbatchnum")]'),
-                "image_name":    g('.//*[contains(@id,"lblImageName")]'),
-                "dmg_image":     g('.//*[contains(@id,"lblDmgImg2Name")]'),
+                "base_price":    LGBot.XP_BASE_PRICE(tr).strip(),
+                "batchno":       LGBot.XP_BATCHNO(tr).strip(),
+                "image_name":    LGBot.XP_IMAGE_NAME(tr).strip(),
+                "dmg_image":     LGBot.XP_DMG_IMAGE(tr).strip(),
                 "image_url":     image_url,
                 "dmg_image_url": dmg_url,
-                "serial_no":     g('.//*[contains(@id,"lblsrno")]').strip().upper(),
-                "model_code":    g('.//*[contains(@id,"lblModelCode")]'),
-                "product":       g('.//*[contains(@id,"lblProduct")]'),
-                "branch":        g('.//*[contains(@id,"lblBranch")]'),
-                "bill_branch":   g('.//*[contains(@id,"lblBill_Branch") or contains(@id,"lblBillBranch")]'),
-                "category":      g('.//*[contains(@id,"lblDiscCategory")]'),
-                "from_date":     g('.//*[contains(@id,"lblfromdate")]'),
-                "to_date":       g('.//*[contains(@id,"lbltodate")]'),
-                "dealer_price":  g('.//*[contains(@id,"lbldealerp")]'),
-                "dp":            g('.//*[contains(@id,"lbldp")]'),
-                "defect":        g('.//*[contains(@id,"lbltypeofdefect")]'),
+                "serial_no":     LGBot.XP_SRNO(tr).strip().upper(),
+                "model_code":    LGBot.XP_MODEL_CODE(tr).strip(),
+                "product":       LGBot.XP_PRODUCT(tr).strip(),
+                "branch":        LGBot.XP_BRANCH(tr).strip(),
+                "bill_branch":   LGBot.XP_BILL_BRANCH(tr).strip(),
+                "category":      LGBot.XP_CATEGORY(tr).strip(),
+                "from_date":     LGBot.XP_FROM_DATE(tr).strip(),
+                "to_date":       LGBot.XP_TO_DATE(tr).strip(),
+                "dealer_price":  LGBot.XP_DEALER_PRICE(tr).strip(),
+                "dp":            LGBot.XP_DP(tr).strip(),
+                "defect":        LGBot.XP_DEFECT(tr).strip(),
             })
         return inventory
 
@@ -659,6 +712,16 @@ class LGBot:
         self._current_page_arg = initial_arg
         pages: list[tuple[str | None, list[dict]]] = [(initial_arg, page1_rows)]
 
+        page1_serials = {r["serial_no"] for r in page1_rows}
+
+        # ── LATENCY OPT: check if page 1 alone already contains actionable matches.
+        # If so, return immediately to fire bids within <1s without waiting for pages 2-5.
+        page1_pending = [r for r in page1_rows if r["serial_no"].strip().upper() not in self._booked_serials]
+        page1_matched = self._filter_inventory(page1_pending)
+        if page1_matched:
+            _log("scan", f"Found {len(page1_matched)} match(es) directly on page 1 — bidding immediately to minimize latency")
+            return pages
+
         # Target serial accounting:
         unbooked_targets = {
             s.strip().upper() for s in self.serial_numbers
@@ -675,6 +738,22 @@ class LGBot:
         else:
             remaining_targets = set()
 
+        # ── LATENCY OPT: If page 1 serials haven't changed and no target serials are missing,
+        # reuse cached inventory from previous full crawl (cuts iteration time from ~5.5s to ~0.8s).
+        can_use_cache = (
+            bool(self._cached_pages)
+            and page1_serials == self._cached_page1_serials
+            and (self.iter - self._last_full_scan_iter) < FULL_SCAN_EVERY
+            and not (self.serial_numbers and remaining_targets)
+        )
+        if can_use_cache:
+            _log("scan", f"Page 1 unchanged ({len(page1_rows)} items) — using cached pages ({len(self._cached_inventory)} items total)")
+            combined_pages = [(initial_arg, page1_rows)]
+            for arg, rows in self._cached_pages:
+                if arg != initial_arg:
+                    combined_pages.append((arg, rows))
+            return combined_pages
+
         seen: set[str] = {initial_arg} if initial_arg else set()
         pending = [a for a in page_args if a != initial_arg]
         for a in pending:
@@ -686,43 +765,44 @@ class LGBot:
         while pending:
             batch = pending[:8]
             pending = pending[8:]
-            max_workers = min(len(batch), 8)
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                fut_to_arg = {executor.submit(self._fetch_page_stateless, a): a for a in batch}
-                for fut in fut_to_arg:
-                    arg, rows, tree2 = fut.result()
-                    if tree2 is None:
-                        continue
-                    pages.append((arg, rows))
-                    _log("scan", f"Grid page {arg}: {len(rows)} item(s)")
+            fut_to_arg = {self._pool.submit(self._fetch_page_stateless, a): a for a in batch}
+            for fut in fut_to_arg:
+                arg, rows, tree2 = fut.result()
+                if tree2 is None:
+                    continue
+                pages.append((arg, rows))
+                _log("scan", f"Grid page {arg}: {len(rows)} item(s)")
 
-                    if unbooked_targets:
-                        found_here = {r["serial_no"] for r in rows if r["serial_no"] in remaining_targets}
-                        if found_here:
-                            remaining_targets -= found_here
-                            if matched_target_tree is None:
-                                matched_target_tree = tree2
-                                matched_target_arg = arg
-                            _log("scan", f"Page {arg}: found {len(found_here)} target serial(s), {len(remaining_targets)} remaining")
-                            if not remaining_targets:
-                                # All target serials found! No need to crawl further pages
-                                pending.clear()
-                                break
+                if unbooked_targets:
+                    found_here = {r["serial_no"] for r in rows if r["serial_no"] in remaining_targets}
+                    if found_here:
+                        remaining_targets -= found_here
+                        if matched_target_tree is None:
+                            matched_target_tree = tree2
+                            matched_target_arg = arg
+                        _log("scan", f"Page {arg}: found {len(found_here)} target serial(s), {len(remaining_targets)} remaining")
+                        if not remaining_targets:
+                            # All target serials found! No need to crawl further pages
+                            pending.clear()
+                            break
 
-                    # If targets are still missing (or scanning all), check for further pager windows (e.g. Page$11+)
-                    if (not self.serial_numbers or remaining_targets) and tree2 is not None:
-                        _, more_args, _ = self.parse_pager(tree2)
-                        for a in more_args:
-                            if a not in seen:
-                                seen.add(a)
-                                pending.append(a)
+                # If targets are still missing (or scanning all), check for further pager windows (e.g. Page$11+)
+                if (not self.serial_numbers or remaining_targets) and tree2 is not None:
+                    _, more_args, _ = self.parse_pager(tree2)
+                    for a in more_args:
+                        if a not in seen:
+                            seen.add(a)
+                            pending.append(a)
 
         if matched_target_tree is not None:
             # Set active page state to the matched page so btnSave postback works with 0 re-navigations
             self._extract_hidden(matched_target_tree)
             self._current_page_arg = matched_target_arg
 
+        self._cached_pages = pages
+        self._cached_page1_serials = page1_serials
+        self._last_full_scan_iter = self.iter
         return pages
 
     def collect_inventory(self, tree: html.HtmlElement) -> list[dict]:
@@ -1100,21 +1180,14 @@ class LGBot:
         def _on_stop(signum, frame):
             nonlocal stopping
             stopping = True
+            try:
+                self._pool.shutdown(wait=False)
+            except Exception:
+                pass
             _log("info", f"Received {signal.Signals(signum).name} — stopping | booked={self.bids_placed} detected={self.detected_count} failed={self.failed_count}")
 
         signal.signal(signal.SIGTERM, _on_stop)
         signal.signal(signal.SIGINT, _on_stop)
-
-        # ── LATENCY OPT: warm up TLS connection before first iteration
-        if self.url:
-            def _warmup():
-                try:
-                    self.get_initial()
-                    _log("info", f"Connection warmed | Ship-to: {self.ship_to[:20]}")
-                except Exception as e:
-                    _log("warn", f"Warm-up failed: {e}")
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                pool.submit(_warmup)
 
         while True:
             if stopping:
@@ -1125,8 +1198,7 @@ class LGBot:
             _log("info", f"Iteration {self.iter} | booked={self.bids_placed} detected={self.detected_count} failed={self.failed_count}")
 
             try:
-                # ── LATENCY OPT: skip the full GET when session is authorized
-                # and we have cached inventory.
+                # ── LATENCY OPT: skip full re-crawl when session is authorized and targets known
                 unbooked_targets = {
                     s.strip().upper() for s in self.serial_numbers
                     if s.strip().upper() not in self._booked_serials
@@ -1153,32 +1225,24 @@ class LGBot:
                     if not self.viewstate:
                         tree = self.get_initial()
                         if tree is None:
-                            _log("warn", "GET page failed, retry in 2s")
-                            time.sleep(2)
+                            _log("warn", "GET page failed, retrying")
+                            time.sleep(self.retry_backoff_s if self.retry_backoff_s > 0 else 0.05)
                             continue
                         _log("info", f"Ship-to: {self.ship_to[:20]}")
-                        tree = self.search()
-                        if tree is None:
-                            _log("warn", "Initial search failed, retry in 2s")
-                            time.sleep(2)
-                            continue
                     else:
-                        # ── LATENCY OPT: Re-use active session and POST search directly (cuts ~1.5s cold GET)
+                        # ── LATENCY OPT: Re-use active session and POST search directly
                         tree = self.search()
                         if tree is None:
                             _log("warn", "Search post failed, re-initializing session with GET")
+                            time.sleep(self.retry_backoff_s if self.retry_backoff_s > 0 else 0.05)
                             tree = self.get_initial()
-                            if tree is not None:
-                                tree = self.search()
                             if tree is None:
-                                time.sleep(2)
+                                time.sleep(self.retry_backoff_s if self.retry_backoff_s > 0 else 0.05)
                                 continue
 
                     pages = self.collect_pages(tree)
                     inventory = self._dedup_inventory([r for _, rows in pages for r in rows])
                     self._cached_inventory = inventory
-                    self._cached_page1_serials = {r["serial_no"] for r in inventory}
-                    self._last_full_scan_iter = self.iter
                     _log("scan", f"Found {len(inventory)} item(s) across grid")
 
                 if inventory:
@@ -1187,17 +1251,24 @@ class LGBot:
                     if len(pending) != len(inventory):
                         _log("scan", f"Skipping {len(inventory) - len(pending)} already-booked item(s)")
                     matched = self._filter_inventory(pending)
+                    filter_desc = []
                     if self.serial_numbers:
-                        _log("scan", f"{len(matched)} of {len(inventory)} item(s) match serial filter {list(self.serial_numbers)[:3]}")
-                    else:
-                        _log("scan", f"{len(matched)} of {len(inventory)} item(s) match price/DP filter")
+                        filter_desc.append(f"serial {list(self.serial_numbers)[:3]}")
+                    if self.filter_by_product and self.products:
+                        filter_desc.append(f"product {self.product_mode} {list(self.products)}")
+                    if self.filter_by_price:
+                        filter_desc.append(f"price ₹{self.min_price}–₹{self.max_price}")
+                    if self.filter_by_dp and self.dp_percents:
+                        filter_desc.append(f"DP {list(self.dp_percents)}")
+                    desc_str = ", ".join(filter_desc) if filter_desc else "no filters"
+                    _log("scan", f"{len(matched)} of {len(inventory)} item(s) match criteria ({desc_str})")
 
                     if matched:
                         for r in matched:
                             self._detected_serials.add(r["serial_no"])
                         self.detected_count = len(self._detected_serials)
                         for i, r in enumerate(matched):
-                            _log("detect", f"Match #{i+1}: {r['serial_no'][:15]} | {r['model_code']} | ₹{r['dealer_price']} | {r['dp']}%")
+                            _log("detect", f"Match #{i+1}: {r['serial_no'][:15]} | {r.get('product', '')} | {r['model_code']} | ₹{r['dealer_price']} | {r['dp']}%")
 
                         # Fast path: LG keeps the session OTP-authorized after the
                         # first successful cycle, so once authorized we submit the
@@ -1262,18 +1333,21 @@ class LGBot:
             elapsed_ms = int(elapsed * 1000)
             _log("info", f"Completed in {elapsed_ms}ms")
 
-            # Adaptive sleep: skip sleep when there are unbooked items to
-            # maximise booking speed.  Only sleep at the configured interval
-            # when the bot is idle (no matches or everything already booked).
-            has_pending = bool(
-                self._cached_inventory
-                and any(r["serial_no"].strip().upper() not in self._booked_serials for r in self._cached_inventory)
-            )
-            if has_pending:
-                sleep = 0.05  # 50ms — just enough to yield CPU
+            # Zero-latency loop: when scan_interval is 0, run back-to-back with 0ms sleep.
+            # Only sleep when scan_interval is explicitly set > 0 and no unbooked matches exist.
+            if self.scan_interval <= 0:
+                sleep = 0.0
             else:
-                sleep = max(0.1, self.scan_interval - elapsed)
-            time.sleep(sleep)
+                has_pending = bool(
+                    self._cached_inventory
+                    and any(r["serial_no"].strip().upper() not in self._booked_serials for r in self._cached_inventory)
+                )
+                if has_pending:
+                    sleep = 0.0
+                else:
+                    sleep = max(0.0, self.scan_interval - elapsed)
+            if sleep > 0:
+                time.sleep(sleep)
 
             self._send_kpi(elapsed_ms)
 
