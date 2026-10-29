@@ -7,9 +7,10 @@ import re
 import signal
 import socket
 import sys
+import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import httpx
@@ -27,9 +28,21 @@ OTP_POLL_INTERVAL = max(0.01, float(os.environ.get("OTP_POLL_INTERVAL_S", "0.01"
 # When set, the bot prints the exact data it would send to SaveBiddingData
 # (including image URLs) instead of actually submitting the bid.
 DRY_RUN = os.environ.get("BOT_DRY_RUN", "0") == "1"
+# Pre-warm OTP authorization before target drop time using any existing item on the grid
+PREWARM_AUTH = os.environ.get("PREWARM_AUTH", "1") == "1"
 # Re-run a full multi-page grid scan at least this often, even if page 1
 # hasn't changed (catches items added on later pages).
 FULL_SCAN_EVERY = int(os.environ.get("FULL_SCAN_EVERY", "20"))
+# Refresh OTP authorization if older than 12 minutes (LG session expires in 15 minutes)
+SESSION_AUTH_TTL_S = float(os.environ.get("SESSION_AUTH_TTL_S", str(12 * 60)))
+# Precision drop bursting (burst polling at drop time)
+DROP_BURST_ENABLED = os.environ.get("DROP_BURST_ENABLED", "1") == "1"
+DROP_TIME = os.environ.get("DROP_TIME", "20:31:00")  # HH:MM:SS format (IST)
+DROP_BURST_LEAD_S = float(os.environ.get("DROP_BURST_LEAD_S", "3.0"))  # Start burst N seconds before drop
+DROP_BURST_DURATION_S = float(os.environ.get("DROP_BURST_DURATION_S", "10.0"))  # Total burst window duration
+DROP_BURST_INTERVAL_S = float(os.environ.get("DROP_BURST_INTERVAL_S", "0.05"))  # 50ms interval during burst
+# Parallel atomic submissions (fire each item individually in parallel rather than 1 large batch to prevent Oracle table lock/rollback)
+PARALLEL_ATOMIC_SUBMISSION = os.environ.get("PARALLEL_ATOMIC_SUBMISSION", "1") == "1"
 
 
 def _log(level: str, message: str) -> None:
@@ -136,7 +149,10 @@ class LGBot:
             timeout=60.0,
             transport=transport,
         )
-        self._pool = ThreadPoolExecutor(max_workers=8)
+        self._pool = ThreadPoolExecutor(max_workers=24)
+        self._state_lock = threading.Lock()
+        self._dispatched_serials: set[str] = set()
+        self._active_booking_futs: list = []
         self.viewstate: str | None = None
         self.eventvalidation: str | None = None
         self.generator: str = "95C5CE92"
@@ -167,12 +183,17 @@ class LGBot:
         self.timeout_s: float = 5.0
         self.email: str = ""
         self.app_password: str = ""
+        self.prewarm: bool = PREWARM_AUTH
         self._ws: _WSPusher | None = None
 
         # LG keeps the session OTP-authorized after a successful ValidateOtp, so
         # once authorized we can fire SaveBiddingData directly without a new OTP
         # cycle. Cleared when LG replies "not authorized"/"expired".
         self._session_authorized = False
+        self._authorized_at: float = 0.0
+        self.drop_time: str = DROP_TIME
+        self.drop_burst_enabled: bool = DROP_BURST_ENABLED
+        self._connections_warmed: bool = False
         # Cached inventory from the last full multi-page scan, keyed by page-1
         # serial set, so we skip re-fetching every grid page each iteration.
         self._cached_inventory: list[dict] = []
@@ -310,7 +331,7 @@ class LGBot:
             return
         list(self._pool.map(self._report_booking, rows))
 
-    def _submit_authorized(self, inventory: list[dict]) -> str:
+    def _submit_authorized(self, inventory: list[dict], source_label: str = "") -> str:
         """Fast path: LG session is already OTP-authorized.
 
         Fires SaveBiddingData directly — no begin/save/validate OTP cycle. If LG
@@ -318,6 +339,7 @@ class LGBot:
 
         Returns "ok", "fail" (real submit error), or "session_expired".
         """
+        tag = f"[{source_label}] " if source_label else ""
         if DRY_RUN:
             for i, r in enumerate(inventory):
                 _log("dryrun", json.dumps({
@@ -332,25 +354,123 @@ class LGBot:
                     "batchno": r.get("batchno"),
                     "defect": r.get("defect"),
                 }))
-            _log("dryrun", f"DRY RUN — skipping SaveBiddingData for {len(inventory)} item(s)")
-            for row in inventory:
-                self._booked_serials.add(row["serial_no"].strip().upper())
+            _log("dryrun", f"{tag}DRY RUN — skipping SaveBiddingData for {len(inventory)} item(s)")
+            with self._state_lock:
+                for row in inventory:
+                    s_no = row["serial_no"].strip().upper()
+                    self._booked_serials.add(s_no)
+                    self._dispatched_serials.add(s_no)
+                self.bids_placed += len(inventory)
+                self.attempted_count += len(inventory)
             return "ok"
 
+        # Parallel Atomic Submission: If multiple items match, submit each concurrently in parallel threads
+        # rather than 1 large batch to prevent Oracle unique constraint table lock/rollback across all items.
+        if PARALLEL_ATOMIC_SUBMISSION and len(inventory) > 1 and not DRY_RUN:
+            _log("action", f"{tag}Concurrent atomic submission: firing {len(inventory)} items simultaneously in parallel threads...")
+            salvaged = []
+            futs = {self._pool.submit(self.save_bidding_data, [r]): r for r in inventory}
+            for f, r in futs.items():
+                s_no = r["serial_no"].strip().upper()
+                try:
+                    res = f.result()
+                    _log("info", f"{tag}Atomic item {s_no}: {res or 'ok'}")
+                    if self._save_result_ok(res):
+                        salvaged.append(r)
+                        with self._state_lock:
+                            self._booked_serials.add(s_no)
+                            self._dispatched_serials.add(s_no)
+                    else:
+                        with self._state_lock:
+                            if "ORA-00001" in (res or "") or "unique constraint" in (res or "").lower():
+                                self._booked_serials.add(s_no)
+                            else:
+                                self._dispatched_serials.discard(s_no)
+                        _log("warn", f"{tag}Atomic item {s_no} rejected: {res}")
+                except Exception as e:
+                    _log("warn", f"{tag}Atomic item {s_no} exception: {e}")
+                    with self._state_lock:
+                        self._dispatched_serials.discard(s_no)
+            if salvaged:
+                self._report_bookings(salvaged)
+                with self._state_lock:
+                    self.bids_placed += len(salvaged)
+                    self.attempted_count += len(salvaged)
+                    self.failed_count += len(inventory) - len(salvaged)
+                _log("success", f"{tag}Booked {len(salvaged)}/{len(inventory)} item(s) via concurrent atomic submission!")
+                return "ok"
+            with self._state_lock:
+                self.failed_count += len(inventory)
+            return "fail"
+
         submit_msg = self.save_bidding_data(inventory)
-        _log("info", f"SaveBiddingData: {submit_msg or 'no response'}")
+        _log("info", f"{tag}SaveBiddingData: {submit_msg or 'no response'}")
         if submit_msg is None:
+            with self._state_lock:
+                self.failed_count += len(inventory)
+                for row in inventory:
+                    self._dispatched_serials.discard(row["serial_no"].strip().upper())
             return "fail"
         if not self._save_result_ok(submit_msg):
             if re.search(r"not authorized|expired|session", submit_msg, re.I):
-                _log("warn", f"Session expired ({submit_msg[:120]}) — will re-run OTP")
+                _log("warn", f"{tag}Session expired ({submit_msg[:120]}) — will re-run OTP")
+                with self._state_lock:
+                    self._session_authorized = False
+                    self._authorized_at = 0.0
+                    for row in inventory:
+                        self._dispatched_serials.discard(row["serial_no"].strip().upper())
                 return "session_expired"
-            _log("error", f"LG rejected submission: {submit_msg}")
+
+            # Parallel salvage: If a multi-item batch partially conflicted with another bidder,
+            # immediately submit each item individually in parallel to salvage available items.
+            if len(inventory) > 1 and ("ORA-00001" in submit_msg or "failed" in submit_msg.lower() or "error" in submit_msg.lower()):
+                _log("action", f"{tag}Batch partially conflicted — attempting parallel salvage of {len(inventory)} item(s)...")
+                salvaged = []
+                futs = {self._pool.submit(self.save_bidding_data, [r]): r for r in inventory}
+                for f, r in futs.items():
+                    try:
+                        res = f.result()
+                        s_no = r["serial_no"].strip().upper()
+                        if self._save_result_ok(res):
+                            salvaged.append(r)
+                            with self._state_lock:
+                                self._booked_serials.add(s_no)
+                                self._dispatched_serials.add(s_no)
+                        else:
+                            with self._state_lock:
+                                self._booked_serials.add(s_no)
+                    except Exception:
+                        pass
+                if salvaged:
+                    self._report_bookings(salvaged)
+                    with self._state_lock:
+                        self.bids_placed += len(salvaged)
+                        self.attempted_count += len(salvaged)
+                        self.failed_count += len(inventory) - len(salvaged)
+                    _log("success", f"{tag}Successfully salvaged {len(salvaged)}/{len(inventory)} booking(s) via parallel split!")
+                    return "ok"
+
+            with self._state_lock:
+                self.failed_count += len(inventory)
+                if "ORA-00001" in submit_msg or "unique constraint" in submit_msg.lower():
+                    for row in inventory:
+                        self._booked_serials.add(row["serial_no"].strip().upper())
+                    _log("warn", f"{tag}Items already booked by another bidder ({len(inventory)} items skipped)")
+                else:
+                    for row in inventory:
+                        self._dispatched_serials.discard(row["serial_no"].strip().upper())
+            _log("error", f"{tag}LG rejected submission: {submit_msg}")
             return "fail"
+
         self._report_bookings(inventory)
-        for row in inventory:
-            self._booked_serials.add(row["serial_no"].strip().upper())
-        _log("success", f"Reported {len(inventory)} booking(s) to API (authorized fast path)")
+        with self._state_lock:
+            for row in inventory:
+                s_no = row["serial_no"].strip().upper()
+                self._booked_serials.add(s_no)
+                self._dispatched_serials.add(s_no)
+            self.bids_placed += len(inventory)
+            self.attempted_count += len(inventory)
+        _log("success", f"{tag}Reported {len(inventory)} booking(s) to API (authorized fast path)")
         return "ok"
 
     def _filter_inventory(self, inventory: list[dict]) -> list[dict]:
@@ -406,6 +526,48 @@ class LGBot:
 
             filtered.append(r)
         return filtered
+
+    def _dispatch_page_matches(self, rows: list[dict], source_label: str = "") -> list[dict]:
+        """Immediately filter and dispatch matching items from a freshly parsed page.
+
+        If session is pre-warmed/authorized, submits directly to SaveBiddingData in a
+        background thread so booking starts concurrently while remaining pages are still
+        being fetched or crawled.
+
+        Returns the list of newly matched items.
+        """
+        with self._state_lock:
+            unbooked = [
+                r for r in rows
+                if r["serial_no"].strip().upper() not in self._booked_serials
+                and r["serial_no"].strip().upper() not in self._dispatched_serials
+            ]
+
+        if not unbooked:
+            return []
+
+        matched = self._filter_inventory(unbooked)
+        if not matched:
+            return []
+
+        with self._state_lock:
+            for r in matched:
+                s = r["serial_no"].strip().upper()
+                self._dispatched_serials.add(s)
+                self._detected_serials.add(s)
+            self.detected_count = len(self._detected_serials)
+
+        tag = f"[{source_label}] " if source_label else ""
+        _log("detect", f"{tag}Detected {len(matched)} actionable match(es): {', '.join(r['serial_no'] for r in matched)}")
+
+        if self._session_authorized:
+            _log("action", f"{tag}Session pre-authorized — dispatching {len(matched)} match(es) immediately to SaveBiddingData in background!")
+            fut = self._pool.submit(self._submit_authorized, matched, source_label)
+            self._active_booking_futs.append(fut)
+        else:
+            _log("info", f"{tag}Session not yet pre-authorized — queued {len(matched)} match(es) for primary OTP submission")
+
+        return matched
 
     # ───────── helpers ─────────
 
@@ -474,6 +636,11 @@ class LGBot:
         resp = self._get()
         if resp is None:
             return None
+        # Follow canonical redirect URL if the page redirected (e.g. from /pod/?Code=... to /POD/NGSI_CustomerBiddingInput.aspx?Code=...)
+        if resp.url and str(resp.url) != self.url:
+            canonical = str(resp.url)
+            _log("info", f"Resolved canonical URL: {canonical}")
+            self.url = canonical
         try:
             tree = html.fromstring(resp.content)
         except Exception:
@@ -482,12 +649,12 @@ class LGBot:
         self._parse_dropdowns(tree)
         st = tree.xpath('//*[@id="txtcode"]/@value')
         self.ship_to = st[0] if st else ""
-        if not self.ship_to and "Code=" in self.url:
+        if not self.ship_to:
             try:
                 from urllib.parse import parse_qs, urlparse
-                parsed_q = parse_qs(urlparse(self.url).query)
-                if "Code" in parsed_q:
-                    self.ship_to = parsed_q["Code"][0]
+                parsed_q = {k.lower(): v for k, v in parse_qs(urlparse(self.url).query).items()}
+                if "code" in parsed_q and parsed_q["code"]:
+                    self.ship_to = parsed_q["code"][0]
             except Exception:
                 pass
         self._current_page_arg = None
@@ -650,6 +817,35 @@ class LGBot:
         except Exception:
             return src
 
+    def _check_drop_burst(self) -> tuple[bool, float]:
+        """Check if current time is inside the drop burst window. Returns (is_burst, diff_seconds)."""
+        if not self.drop_burst_enabled or not self.drop_time:
+            return False, 999999.0
+        now = datetime.now()
+        try:
+            parts = [int(p) for p in self.drop_time.split(":")]
+            drop_dt = now.replace(hour=parts[0], minute=parts[1], second=parts[2], microsecond=0)
+        except Exception:
+            return False, 999999.0
+        diff_s = (drop_dt - now).total_seconds()
+        start_lead = -DROP_BURST_LEAD_S
+        end_tail = DROP_BURST_DURATION_S - DROP_BURST_LEAD_S
+        is_burst = (start_lead <= -diff_s <= end_tail)
+        return is_burst, diff_s
+
+    def _warmup_connections(self) -> None:
+        """Pre-warm HTTP/2 connection pool before drop time to eliminate TLS handshake latency."""
+        try:
+            futs = [self._pool.submit(self.sess.get, self.url) for _ in range(3)]
+            for f in futs:
+                try:
+                    f.result(timeout=4.0)
+                except Exception:
+                    pass
+            _log("info", "TLS/HTTP connection pool pre-warmed & hot")
+        except Exception:
+            pass
+
     def _fetch_page(self, page_arg: str) -> html.HtmlElement | None:
         """Fire the __doPostBack pager link for the given Page$N arg."""
         data = {
@@ -714,29 +910,20 @@ class LGBot:
 
         page1_serials = {r["serial_no"] for r in page1_rows}
 
-        # ── LATENCY OPT: check if page 1 alone already contains actionable matches.
-        # If so, return immediately to fire bids within <1s without waiting for pages 2-5.
-        page1_pending = [r for r in page1_rows if r["serial_no"].strip().upper() not in self._booked_serials]
-        page1_matched = self._filter_inventory(page1_pending)
-        if page1_matched:
-            _log("scan", f"Found {len(page1_matched)} match(es) directly on page 1 — bidding immediately to minimize latency")
-            return pages
+        # ── STREAMING BACKGROUND BOOKING: Immediately filter & dispatch page 1 matches!
+        p1_matched = self._dispatch_page_matches(page1_rows, f"page {current}")
 
         # Target serial accounting:
-        unbooked_targets = {
-            s.strip().upper() for s in self.serial_numbers
-            if s.strip().upper() not in self._booked_serials
-        } if self.serial_numbers else set()
+        with self._state_lock:
+            unbooked_targets = {
+                s.strip().upper() for s in self.serial_numbers
+                if s.strip().upper() not in self._booked_serials
+                and s.strip().upper() not in self._dispatched_serials
+            } if self.serial_numbers else set()
 
-        if unbooked_targets:
-            found_page1 = {r["serial_no"] for r in page1_rows if r["serial_no"] in unbooked_targets}
-            remaining_targets = unbooked_targets - found_page1
-            if not remaining_targets:
-                _log("scan", f"All {len(unbooked_targets)} unbooked target serial(s) found on page 1 — stopping pagination immediately to bid")
-                return pages
-            _log("scan", f"Page 1: found {len(found_page1)}/{len(unbooked_targets)} target serial(s), scanning remaining pages for {len(remaining_targets)} remaining")
-        else:
-            remaining_targets = set()
+        if self.serial_numbers and not unbooked_targets:
+            _log("scan", f"All target serial(s) already dispatched from page 1 — stopping pagination")
+            return pages
 
         # ── LATENCY OPT: If page 1 serials haven't changed and no target serials are missing,
         # reuse cached inventory from previous full crawl (cuts iteration time from ~5.5s to ~0.8s).
@@ -744,7 +931,7 @@ class LGBot:
             bool(self._cached_pages)
             and page1_serials == self._cached_page1_serials
             and (self.iter - self._last_full_scan_iter) < FULL_SCAN_EVERY
-            and not (self.serial_numbers and remaining_targets)
+            and not (self.serial_numbers and unbooked_targets)
         )
         if can_use_cache:
             _log("scan", f"Page 1 unchanged ({len(page1_rows)} items) — using cached pages ({len(self._cached_inventory)} items total)")
@@ -752,6 +939,7 @@ class LGBot:
             for arg, rows in self._cached_pages:
                 if arg != initial_arg:
                     combined_pages.append((arg, rows))
+                    self._dispatch_page_matches(rows, f"cached {arg}")
             return combined_pages
 
         seen: set[str] = {initial_arg} if initial_arg else set()
@@ -767,28 +955,32 @@ class LGBot:
             pending = pending[8:]
 
             fut_to_arg = {self._pool.submit(self._fetch_page_stateless, a): a for a in batch}
-            for fut in fut_to_arg:
+            for fut in as_completed(fut_to_arg):
                 arg, rows, tree2 = fut.result()
                 if tree2 is None:
                     continue
                 pages.append((arg, rows))
                 _log("scan", f"Grid page {arg}: {len(rows)} item(s)")
 
+                # ── STREAMING BACKGROUND BOOKING: As each page arrives, dispatch matches immediately!
+                matched_here = self._dispatch_page_matches(rows, f"page {arg}")
+                if matched_here and matched_target_tree is None:
+                    matched_target_tree = tree2
+                    matched_target_arg = arg
+
                 if unbooked_targets:
-                    found_here = {r["serial_no"] for r in rows if r["serial_no"] in remaining_targets}
-                    if found_here:
-                        remaining_targets -= found_here
-                        if matched_target_tree is None:
-                            matched_target_tree = tree2
-                            matched_target_arg = arg
-                        _log("scan", f"Page {arg}: found {len(found_here)} target serial(s), {len(remaining_targets)} remaining")
-                        if not remaining_targets:
-                            # All target serials found! No need to crawl further pages
-                            pending.clear()
-                            break
+                    with self._state_lock:
+                        unbooked_targets = {
+                            s for s in unbooked_targets
+                            if s not in self._booked_serials and s not in self._dispatched_serials
+                        }
+                    if not unbooked_targets:
+                        _log("scan", f"All target serials dispatched — stopping remaining pagination")
+                        pending.clear()
+                        break
 
                 # If targets are still missing (or scanning all), check for further pager windows (e.g. Page$11+)
-                if (not self.serial_numbers or remaining_targets) and tree2 is not None:
+                if (not self.serial_numbers or unbooked_targets) and tree2 is not None:
                     _, more_args, _ = self.parse_pager(tree2)
                     for a in more_args:
                         if a not in seen:
@@ -1063,6 +1255,8 @@ class LGBot:
                         return "fail"
 
                     _log("info", "OTP validated successfully")
+                    self._session_authorized = True
+                    self._authorized_at = time.monotonic()
                     if DRY_RUN:
                         # Print everything we captured (image URLs included) instead
                         # of actually submitting to SaveBiddingData.
@@ -1100,12 +1294,44 @@ class LGBot:
                         return "fail"
                     if not self._save_result_ok(submit_msg):
                         _log("error", f"LG rejected submission: {submit_msg}")
+                        if re.search(r"not authorized|not allowed|expired", submit_msg, re.I):
+                            self._session_authorized = False
+                            self._authorized_at = 0.0
+
+                        # Parallel salvage: If a multi-item batch partially conflicted,
+                        # immediately submit each item individually in parallel to salvage available items.
+                        if len(inventory) > 1 and ("ORA-00001" in submit_msg or "failed" in submit_msg.lower() or "error" in submit_msg.lower()):
+                            _log("action", f"Batch partially conflicted — attempting parallel salvage of {len(inventory)} item(s)...")
+                            salvaged = []
+                            futs = {self._pool.submit(self.save_bidding_data, [r]): r for r in inventory}
+                            for f, r in futs.items():
+                                try:
+                                    res = f.result()
+                                    if self._save_result_ok(res):
+                                        salvaged.append(r)
+                                        self._booked_serials.add(r["serial_no"].strip().upper())
+                                    else:
+                                        self._booked_serials.add(r["serial_no"].strip().upper())
+                                except Exception:
+                                    pass
+                            if salvaged:
+                                self._report_bookings(salvaged)
+                                _log("success", f"Successfully salvaged {len(salvaged)}/{len(inventory)} booking(s) via parallel split!")
+                                self._otp_api("end", {"otp_request_id": req_id})
+                                return "ok"
+
+                        if "ORA-00001" in submit_msg or "unique constraint" in submit_msg.lower():
+                            # Row was already booked by someone else — mark serials as booked so we never retry them
+                            for row in inventory:
+                                self._booked_serials.add(row["serial_no"].strip().upper())
+                            _log("warn", f"Items already booked by another bidder ({len(inventory)} items skipped)")
                         self._otp_api("cancel", {"otp_request_id": req_id})
                         return "fail"
 
                     # OTP validated + submit accepted → LG session stays
                     # authorized; reuse it next iteration (no new OTP cycle).
                     self._session_authorized = True
+                    self._authorized_at = time.monotonic()
                     self._report_bookings(inventory)
                     for row in inventory:
                         self._booked_serials.add(row["serial_no"].strip().upper())
@@ -1168,6 +1394,74 @@ class LGBot:
             _log("error", f"OTP flow failed for {len(matched)} item(s)")
         return result
 
+    def prewarm_auth(self, pages: list) -> bool:
+        """Pre-authorize session before target drop using existing items on the grid.
+
+        Validates OTP so when target items drop at bidding time, they can be submitted
+        instantly (<300ms) via the authorized fast path (_submit_authorized) without
+        waiting 12-15s for OTP email.
+        """
+        if self._session_authorized:
+            return True
+
+        sample_row = None
+        for page_arg, rows in pages:
+            if rows:
+                if page_arg is not None and page_arg != getattr(self, "_current_page_arg", None):
+                    tree_pg = self._fetch_page(page_arg)
+                    if tree_pg is None:
+                        continue
+                sample_row = rows[0]
+                break
+
+        if not sample_row:
+            _log("warn", "Cannot pre-warm: no items on grid to trigger OTP email")
+            return False
+
+        _log("action", f"Pre-warming session OTP authorization using {sample_row.get('serial_no')}...")
+        begin = self._otp_api("begin", {
+            "worker_id": self.worker_id,
+            "ship_to": self.ship_to,
+            "email": self.email,
+            "app_password": self.app_password,
+            "item_count": 1,
+        })
+        if not begin or begin.get("status") == "busy":
+            _log("warn", f"Pre-warm OTP lock busy: {begin}")
+            return False
+        req_id = begin.get("otp_request_id")
+        if not req_id:
+            return False
+
+        resp = self.save([sample_row])
+        if resp is None:
+            self._otp_api("cancel", {"otp_request_id": req_id})
+            return False
+
+        deadline = time.monotonic() + OTP_TIMEOUT
+        while time.monotonic() < deadline:
+            res = self._otp_api("fetch", {"otp_request_id": req_id})
+            if res:
+                if res.get("status") == "done":
+                    otp = res.get("otp")
+                    validated = self.validate_otp(otp)
+                    if validated == "SUCCESS":
+                        self._session_authorized = True
+                        self._authorized_at = time.monotonic()
+                        self._otp_api("end", {"otp_request_id": req_id})
+                        _log("success", "Pre-warm authorization SUCCESS! Fast-path bidding is ARMED (<300ms latency).")
+                        return True
+                    else:
+                        _log("error", f"Pre-warm OTP validation failed: {validated}")
+                        self._otp_api("cancel", {"otp_request_id": req_id})
+                        return False
+                elif res.get("status") in ("timeout", "error", "cancelled"):
+                    break
+            time.sleep(OTP_POLL_INTERVAL)
+        self._otp_api("cancel", {"otp_request_id": req_id})
+        _log("warn", "Pre-warm OTP timed out")
+        return False
+
     # ───────── forever loop ─────────
 
     def run_forever(self) -> None:
@@ -1197,7 +1491,26 @@ class LGBot:
             t_start = time.perf_counter()
             _log("info", f"Iteration {self.iter} | booked={self.bids_placed} detected={self.detected_count} failed={self.failed_count}")
 
+            # Precision drop burst & connection arming
+            in_burst = False
+            if self.drop_burst_enabled:
+                in_burst, diff_s = self._check_drop_burst()
+                if in_burst:
+                    _log("action", f"🔥 DROP BURST ACTIVE ({diff_s:+.2f}s from {self.drop_time}) — scanning at {DROP_BURST_INTERVAL_S*1000:.0f}ms frequency!")
+                elif 1.0 <= diff_s <= 15.0 and not self._connections_warmed:
+                    _log("action", f"⚡ ARMING TCP: Drop in {diff_s:.1f}s — pre-warming HTTP connection pool...")
+                    self._warmup_connections()
+                    self._connections_warmed = True
+                elif diff_s > 60.0:
+                    self._connections_warmed = False
+
             try:
+                # Expire warm authorization if older than 12 minutes (LG OTP expires in 15m)
+                if self._session_authorized and (time.monotonic() - self._authorized_at > SESSION_AUTH_TTL_S):
+                    _log("warn", "Session authorization TTL expired (12m) — resetting for pre-warm refresh")
+                    self._session_authorized = False
+                    self._authorized_at = 0.0
+
                 # ── LATENCY OPT: skip full re-crawl when session is authorized and targets known
                 unbooked_targets = {
                     s.strip().upper() for s in self.serial_numbers
@@ -1245,11 +1558,29 @@ class LGBot:
                     self._cached_inventory = inventory
                     _log("scan", f"Found {len(inventory)} item(s) across grid")
 
+                # Wait for any in-flight background streaming bookings from collect_pages
+                if self._active_booking_futs:
+                    for fut in self._active_booking_futs:
+                        try:
+                            fut.result(timeout=10.0)
+                        except Exception as e:
+                            _log("warn", f"Background booking error: {e}")
+                    self._active_booking_futs.clear()
+
                 if inventory:
-                    # Never re-submit items already booked successfully.
-                    pending = [r for r in inventory if r["serial_no"].strip().upper() not in self._booked_serials]
+                    # Pre-warm session OTP authorization ahead of target drop time
+                    if self.prewarm and not self._session_authorized and pages:
+                        self.prewarm_auth(pages)
+
+                    # Never re-submit items already booked or in-flight.
+                    with self._state_lock:
+                        pending = [
+                            r for r in inventory
+                            if r["serial_no"].strip().upper() not in self._booked_serials
+                            and r["serial_no"].strip().upper() not in self._dispatched_serials
+                        ]
                     if len(pending) != len(inventory):
-                        _log("scan", f"Skipping {len(inventory) - len(pending)} already-booked item(s)")
+                        _log("scan", f"Skipping {len(inventory) - len(pending)} already-booked or dispatched item(s)")
                     matched = self._filter_inventory(pending)
                     filter_desc = []
                     if self.serial_numbers:
@@ -1264,29 +1595,27 @@ class LGBot:
                     _log("scan", f"{len(matched)} of {len(inventory)} item(s) match criteria ({desc_str})")
 
                     if matched:
-                        for r in matched:
-                            self._detected_serials.add(r["serial_no"])
-                        self.detected_count = len(self._detected_serials)
+                        with self._state_lock:
+                            for r in matched:
+                                s = r["serial_no"].strip().upper()
+                                self._dispatched_serials.add(s)
+                                self._detected_serials.add(s)
+                            self.detected_count = len(self._detected_serials)
                         for i, r in enumerate(matched):
-                            _log("detect", f"Match #{i+1}: {r['serial_no'][:15]} | {r.get('product', '')} | {r['model_code']} | ₹{r['dealer_price']} | {r['dp']}%")
+                            _log("detect", f"Match #{i+1}: {r['serial_no'][:15]} | {r.get('product', '')} | {r['model_code']} | ₹{r.get('dealer_price') or r.get('base_price') or '0'} | {r['dp']}%")
 
                         # Fast path: LG keeps the session OTP-authorized after the
                         # first successful cycle, so once authorized we submit the
                         # whole matched set with a single SaveBiddingData call —
-                        # no begin/save/OTP/validate. SaveBiddingData is a stateless
-                        # page method (full selectedRows array), so it has no page
-                        # or checkbox requirement.
+                        # no begin/save/OTP/validate.
                         if self._session_authorized:
-                            result = self._submit_authorized(matched)
-                            if result == "ok":
-                                self.bids_placed += len(matched)
-                                self.attempted_count += len(matched)
-                                _log("success", f"Booked {len(matched)} item(s) in a single SaveBiddingData call")
-                            elif result == "session_expired":
+                            result = self._submit_authorized(matched, "catchup batch")
+                            if result == "session_expired":
                                 # Session died (LG side) — not a booking failure.
                                 # If we have a real grid page we re-run OTP now;
                                 # otherwise next iteration does a full scan + OTP.
                                 self._session_authorized = False
+                                self._authorized_at = 0.0
                                 _log("warn", "Session expired — re-running full OTP cycle")
                                 if not pages:
                                     tree_fresh = self.get_initial()
@@ -1297,29 +1626,29 @@ class LGBot:
                                 if pages:
                                     result = self._run_full_otp(matched, pages)
                                     if result == "ok":
-                                        self.bids_placed += len(matched)
-                                        self.attempted_count += len(matched)
+                                        with self._state_lock:
+                                            self.bids_placed += len(matched)
+                                            self.attempted_count += len(matched)
                                     elif result != "busy":
-                                        self.failed_count += len(matched)
-                                        self.attempted_count += len(matched)
+                                        with self._state_lock:
+                                            self.failed_count += len(matched)
+                                            self.attempted_count += len(matched)
                                         _log("error", f"OTP flow failed for {len(matched)} item(s)")
                                 else:
                                     _log("warn", "Retrying with a full OTP cycle next iteration")
-                            else:
-                                self.failed_count += len(matched)
-                                self.attempted_count += len(matched)
-                                _log("error", f"Authorized submit failed for {len(matched)} item(s)")
                         else:
                             result = self._run_full_otp(matched, pages)
                             if result == "ok":
-                                self.bids_placed += len(matched)
-                                self.attempted_count += len(matched)
+                                with self._state_lock:
+                                    self.bids_placed += len(matched)
+                                    self.attempted_count += len(matched)
                                 _log("success", f"Booked {len(matched)} item(s) in a single SaveBiddingData call")
                             elif result == "busy":
                                 _log("warn", "OTP lock busy — retrying next iteration")
                             else:
-                                self.failed_count += len(matched)
-                                self.attempted_count += len(matched)
+                                with self._state_lock:
+                                    self.failed_count += len(matched)
+                                    self.attempted_count += len(matched)
                                 _log("error", f"OTP flow failed for {len(matched)} item(s)")
                     else:
                         _log("scan", "No items match filter criteria")
@@ -1333,9 +1662,10 @@ class LGBot:
             elapsed_ms = int(elapsed * 1000)
             _log("info", f"Completed in {elapsed_ms}ms")
 
-            # Zero-latency loop: when scan_interval is 0, run back-to-back with 0ms sleep.
-            # Only sleep when scan_interval is explicitly set > 0 and no unbooked matches exist.
-            if self.scan_interval <= 0:
+            # Precision drop burst or standard scan interval sleep:
+            if in_burst:
+                sleep = DROP_BURST_INTERVAL_S
+            elif self.scan_interval <= 0:
                 sleep = 0.0
             else:
                 has_pending = bool(
@@ -1355,8 +1685,20 @@ class LGBot:
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
+    global DRY_RUN
     args = [a for a in sys.argv[1:] if a]
     forever = "--forever" in args
+    run_once = "--once" in args
+
+    if "--dry-run" in args or os.environ.get("BOT_DRY_RUN") == "1":
+        DRY_RUN = True
+        os.environ["BOT_DRY_RUN"] = "1"
+        _log("info", "DRY RUN MODE ACTIVE — bids will be simulated and verified without submission")
+
+    drop_time_arg = None
+    for a in args:
+        if a.startswith("--drop-time="):
+            drop_time_arg = a.split("=", 1)[1]
 
     api_url = None
     filter_id = None
@@ -1398,6 +1740,14 @@ def main():
             worker_id=worker_id,
             service_key=service_key,
         )
+        if "--no-prewarm" in args:
+            bot.prewarm = False
+        elif "--prewarm" in args:
+            bot.prewarm = True
+        if "--no-burst" in args:
+            bot.drop_burst_enabled = False
+        if drop_time_arg:
+            bot.drop_time = drop_time_arg
         bot.fetch_config()
     else:
         if not url:
@@ -1411,8 +1761,28 @@ def main():
             print("URL required")
             sys.exit(1)
         bot = LGBot(url=url)
+        if "--no-prewarm" in args:
+            bot.prewarm = False
+        elif "--prewarm" in args:
+            bot.prewarm = True
+        if "--no-burst" in args:
+            bot.drop_burst_enabled = False
+        if drop_time_arg:
+            bot.drop_time = drop_time_arg
 
-    bot.run_forever()
+    if run_once:
+        _log("info", "Single run requested (--once)")
+        tree = bot.get_initial()
+        if tree is not None:
+            pages = bot.collect_pages(tree)
+            inventory = bot._dedup_inventory([r for _, rows in pages for r in rows])
+            _log("scan", f"Single run complete: found {len(inventory)} total item(s) across {len(pages)} page(s)")
+            matched = bot._filter_inventory(inventory)
+            _log("scan", f"Matched items: {len(matched)}")
+            for m in matched[:10]:
+                _log("dryrun", f"Match: {m.get('serial_no')} | {m.get('model_code')} | ₹{m.get('dealer_price')} | DP {m.get('dp')}%")
+    else:
+        bot.run_forever()
 
 
 if __name__ == "__main__":
