@@ -35,6 +35,11 @@ PREWARM_AUTH = os.environ.get("PREWARM_AUTH", "1") == "1"
 FULL_SCAN_EVERY = int(os.environ.get("FULL_SCAN_EVERY", "20"))
 # Refresh OTP authorization if older than 12 minutes (LG session expires in 15 minutes)
 SESSION_AUTH_TTL_S = float(os.environ.get("SESSION_AUTH_TTL_S", str(12 * 60)))
+# Pre-warm window configuration: only pre-warm within 8 to 1 minutes before scheduled drop
+PREWARM_WINDOW_START_S = float(os.environ.get("PREWARM_WINDOW_START_S", str(8 * 60)))  # 8 mins before drop
+PREWARM_WINDOW_END_S = float(os.environ.get("PREWARM_WINDOW_END_S", "60.0"))           # Stop pre-warm 1 min before drop
+PREWARM_COOLDOWN_S = float(os.environ.get("PREWARM_COOLDOWN_S", "180.0"))              # 3 min cooldown on failure
+MAX_PREWARM_ATTEMPTS = int(os.environ.get("MAX_PREWARM_ATTEMPTS", "2"))
 # Precision drop bursting (burst polling at drop time)
 DROP_BURST_ENABLED = os.environ.get("DROP_BURST_ENABLED", "1") == "1"
 DROP_TIME = os.environ.get("DROP_TIME", "20:31:00")  # HH:MM:SS format (IST)
@@ -191,6 +196,8 @@ class LGBot:
         # cycle. Cleared when LG replies "not authorized"/"expired".
         self._session_authorized = False
         self._authorized_at: float = 0.0
+        self._last_prewarm_time: float = 0.0
+        self._prewarm_attempts: int = 0
         self.drop_time: str = DROP_TIME
         self.drop_burst_enabled: bool = DROP_BURST_ENABLED
         self._connections_warmed: bool = False
@@ -369,6 +376,7 @@ class LGBot:
         if PARALLEL_ATOMIC_SUBMISSION and len(inventory) > 1 and not DRY_RUN:
             _log("action", f"{tag}Concurrent atomic submission: firing {len(inventory)} items simultaneously in parallel threads...")
             salvaged = []
+            session_expired = False
             futs = {self._pool.submit(self.save_bidding_data, [r]): r for r in inventory}
             for f, r in futs.items():
                 s_no = r["serial_no"].strip().upper()
@@ -381,6 +389,8 @@ class LGBot:
                             self._booked_serials.add(s_no)
                             self._dispatched_serials.add(s_no)
                     else:
+                        if re.search(r"not authorized|expired|session", res or "", re.I):
+                            session_expired = True
                         with self._state_lock:
                             if "ORA-00001" in (res or "") or "unique constraint" in (res or "").lower():
                                 self._booked_serials.add(s_no)
@@ -391,6 +401,17 @@ class LGBot:
                     _log("warn", f"{tag}Atomic item {s_no} exception: {e}")
                     with self._state_lock:
                         self._dispatched_serials.discard(s_no)
+
+            if session_expired:
+                _log("warn", f"{tag}Session expired during atomic submission ({len(inventory) - len(salvaged)} items remaining) — will re-run OTP")
+                with self._state_lock:
+                    self._session_authorized = False
+                    self._authorized_at = 0.0
+                    for row in inventory:
+                        if row not in salvaged:
+                            self._dispatched_serials.discard(row["serial_no"].strip().upper())
+                return "session_expired"
+
             if salvaged:
                 self._report_bookings(salvaged)
                 with self._state_lock:
@@ -833,6 +854,21 @@ class LGBot:
         is_burst = (start_lead <= -diff_s <= end_tail)
         return is_burst, diff_s
 
+    def _is_prewarm_window(self) -> bool:
+        """Check if current time is inside the pre-warm window before drop time (default: 8 to 1 mins before drop)."""
+        if not self.prewarm or not self.drop_time:
+            return False
+        now = datetime.now()
+        try:
+            parts = [int(p) for p in self.drop_time.split(":")]
+            drop_dt = now.replace(hour=parts[0], minute=parts[1], second=parts[2], microsecond=0)
+        except Exception:
+            return False
+        diff_s = (drop_dt - now).total_seconds()
+        # Pre-warm only within [PREWARM_WINDOW_END_S, PREWARM_WINDOW_START_S] before drop
+        # E.g. between 20:23:00 and 20:30:00 for a 20:31:00 drop
+        return PREWARM_WINDOW_END_S <= diff_s <= PREWARM_WINDOW_START_S
+
     def _warmup_connections(self) -> None:
         """Pre-warm HTTP/2 connection pool before drop time to eliminate TLS handshake latency."""
         try:
@@ -1114,7 +1150,7 @@ class LGBot:
         for r in inventory:
             def num(s: str) -> int | float:
                 try:
-                    v = float((s or "").replace(",", "").strip())
+                    v = float((s or "").replace(",", "").replace("%", "").strip())
                 except ValueError:
                     return 0
                 # LG expects the exact portal value: "50" stays 50, "420000"
@@ -1404,6 +1440,16 @@ class LGBot:
         if self._session_authorized:
             return True
 
+        if not self._is_prewarm_window():
+            return False
+
+        if self._prewarm_attempts >= MAX_PREWARM_ATTEMPTS:
+            return False
+
+        now_mono = time.monotonic()
+        if (now_mono - self._last_prewarm_time) < PREWARM_COOLDOWN_S:
+            return False
+
         sample_row = None
         for page_arg, rows in pages:
             if rows:
@@ -1418,7 +1464,10 @@ class LGBot:
             _log("warn", "Cannot pre-warm: no items on grid to trigger OTP email")
             return False
 
-        _log("action", f"Pre-warming session OTP authorization using {sample_row.get('serial_no')}...")
+        self._last_prewarm_time = now_mono
+        self._prewarm_attempts += 1
+
+        _log("action", f"Pre-warming session OTP authorization for scheduled drop at {self.drop_time} (attempt {self._prewarm_attempts}/{MAX_PREWARM_ATTEMPTS}) using {sample_row.get('serial_no')}...")
         begin = self._otp_api("begin", {
             "worker_id": self.worker_id,
             "ship_to": self.ship_to,
@@ -1448,6 +1497,7 @@ class LGBot:
                     if validated == "SUCCESS":
                         self._session_authorized = True
                         self._authorized_at = time.monotonic()
+                        self._prewarm_attempts = 0
                         self._otp_api("end", {"otp_request_id": req_id})
                         _log("success", "Pre-warm authorization SUCCESS! Fast-path bidding is ARMED (<300ms latency).")
                         return True
@@ -1503,6 +1553,7 @@ class LGBot:
                     self._connections_warmed = True
                 elif diff_s > 60.0:
                     self._connections_warmed = False
+                    self._prewarm_attempts = 0
 
             try:
                 # Expire warm authorization if older than 12 minutes (LG OTP expires in 15m)
@@ -1568,8 +1619,8 @@ class LGBot:
                     self._active_booking_futs.clear()
 
                 if inventory:
-                    # Pre-warm session OTP authorization ahead of target drop time
-                    if self.prewarm and not self._session_authorized and pages:
+                    # Pre-warm session OTP authorization ahead of target drop time (only during pre-warm window)
+                    if self.prewarm and not self._session_authorized and self._is_prewarm_window() and pages:
                         self.prewarm_auth(pages)
 
                     # Never re-submit items already booked or in-flight.
@@ -1633,23 +1684,53 @@ class LGBot:
                                         with self._state_lock:
                                             self.failed_count += len(matched)
                                             self.attempted_count += len(matched)
+                                            for r in matched:
+                                                s_no = r["serial_no"].strip().upper()
+                                                if s_no not in self._booked_serials:
+                                                    self._dispatched_serials.discard(s_no)
                                         _log("error", f"OTP flow failed for {len(matched)} item(s)")
+                                    else:
+                                        with self._state_lock:
+                                            for r in matched:
+                                                self._dispatched_serials.discard(r["serial_no"].strip().upper())
                                 else:
                                     _log("warn", "Retrying with a full OTP cycle next iteration")
+                                    with self._state_lock:
+                                        for r in matched:
+                                            self._dispatched_serials.discard(r["serial_no"].strip().upper())
                         else:
-                            result = self._run_full_otp(matched, pages)
-                            if result == "ok":
-                                with self._state_lock:
-                                    self.bids_placed += len(matched)
-                                    self.attempted_count += len(matched)
-                                _log("success", f"Booked {len(matched)} item(s) in a single SaveBiddingData call")
-                            elif result == "busy":
-                                _log("warn", "OTP lock busy — retrying next iteration")
+                            if not pages:
+                                tree_fresh = self.get_initial()
+                                if tree_fresh is not None:
+                                    tree_fresh = self.search()
+                                if tree_fresh is not None:
+                                    pages = self.collect_pages(tree_fresh)
+                            if pages:
+                                result = self._run_full_otp(matched, pages)
+                                if result == "ok":
+                                    with self._state_lock:
+                                        self.bids_placed += len(matched)
+                                        self.attempted_count += len(matched)
+                                    _log("success", f"Booked {len(matched)} item(s) in a single SaveBiddingData call")
+                                elif result == "busy":
+                                    _log("warn", "OTP lock busy — retrying next iteration")
+                                    with self._state_lock:
+                                        for r in matched:
+                                            self._dispatched_serials.discard(r["serial_no"].strip().upper())
+                                else:
+                                    with self._state_lock:
+                                        self.failed_count += len(matched)
+                                        self.attempted_count += len(matched)
+                                        for r in matched:
+                                            s_no = r["serial_no"].strip().upper()
+                                            if s_no not in self._booked_serials:
+                                                self._dispatched_serials.discard(s_no)
+                                    _log("error", f"OTP flow failed for {len(matched)} item(s)")
                             else:
+                                _log("warn", "No pages available for OTP trigger — retrying next iteration")
                                 with self._state_lock:
-                                    self.failed_count += len(matched)
-                                    self.attempted_count += len(matched)
-                                _log("error", f"OTP flow failed for {len(matched)} item(s)")
+                                    for r in matched:
+                                        self._dispatched_serials.discard(r["serial_no"].strip().upper())
                     else:
                         _log("scan", "No items match filter criteria")
                 else:
