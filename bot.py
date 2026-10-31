@@ -963,8 +963,11 @@ class LGBot:
 
         # ── LATENCY OPT: If page 1 serials haven't changed and no target serials are missing,
         # reuse cached inventory from previous full crawl (cuts iteration time from ~5.5s to ~0.8s).
+        # NEVER use cache during active drop burst window!
+        in_burst_now = self._check_drop_burst()[0]
         can_use_cache = (
-            bool(self._cached_pages)
+            not in_burst_now
+            and bool(self._cached_pages)
             and page1_serials == self._cached_page1_serials
             and (self.iter - self._last_full_scan_iter) < FULL_SCAN_EVERY
             and not (self.serial_numbers and unbooked_targets)
@@ -1562,22 +1565,30 @@ class LGBot:
                     self._session_authorized = False
                     self._authorized_at = 0.0
 
-                # ── LATENCY OPT: skip full re-crawl when session is authorized and targets known
+                # Periodically reload profile config from API (every 60 iterations when not in burst)
+                # so UI changes (DP %, price, excluded products) take effect without pod restart
+                if self.api_url and self.filter_id and not in_burst and (self.iter % 60 == 0):
+                    try:
+                        self.fetch_config()
+                    except Exception:
+                        pass
+
+                # ── LATENCY OPT: skip full re-crawl ONLY when session is authorized AND specific target serials are known
                 unbooked_targets = {
                     s.strip().upper() for s in self.serial_numbers
                     if s.strip().upper() not in self._booked_serials
                 } if self.serial_numbers else set()
 
                 cached_has_all_targets = (
-                    bool(self._cached_inventory)
-                    and (
-                        not unbooked_targets
-                        or all(s in {r["serial_no"] for r in self._cached_inventory} for s in unbooked_targets)
-                    )
+                    bool(self.serial_numbers)
+                    and bool(unbooked_targets)
+                    and bool(self._cached_inventory)
+                    and all(s in {r["serial_no"] for r in self._cached_inventory} for s in unbooked_targets)
                 )
 
                 if (
-                    self._session_authorized
+                    not in_burst
+                    and self._session_authorized
                     and self._cached_inventory
                     and cached_has_all_targets
                     and (self.iter - self._last_full_scan_iter) < FULL_SCAN_EVERY
