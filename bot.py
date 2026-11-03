@@ -11,10 +11,12 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from lxml import etree, html
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 try:
     from websockets.sync.client import connect as ws_connect
@@ -382,17 +384,17 @@ class LGBot:
                 s_no = r["serial_no"].strip().upper()
                 try:
                     res = f.result()
-                    _log("info", f"{tag}Atomic item {s_no}: {res or 'ok'}")
+                    _log("info", f"{tag}Atomic item {s_no}: {res if res is not None else 'HTTP/transport error'}")
                     if self._save_result_ok(res):
                         salvaged.append(r)
                         with self._state_lock:
                             self._booked_serials.add(s_no)
                             self._dispatched_serials.add(s_no)
                     else:
-                        if re.search(r"not authorized|expired|session", res or "", re.I):
+                        if res and re.search(r"not authorized|expired|session", res, re.I):
                             session_expired = True
                         with self._state_lock:
-                            if "ORA-00001" in (res or "") or "unique constraint" in (res or "").lower():
+                            if res and ("ORA-00001" in res or "unique constraint" in res.lower()):
                                 self._booked_serials.add(s_no)
                             else:
                                 self._dispatched_serials.discard(s_no)
@@ -404,6 +406,12 @@ class LGBot:
 
             if session_expired:
                 _log("warn", f"{tag}Session expired during atomic submission ({len(inventory) - len(salvaged)} items remaining) — will re-run OTP")
+                if salvaged:
+                    self._report_bookings(salvaged)
+                    with self._state_lock:
+                        self.bids_placed += len(salvaged)
+                        self.attempted_count += len(salvaged)
+                    _log("success", f"{tag}Booked {len(salvaged)}/{len(inventory)} item(s) before session expired!")
                 with self._state_lock:
                     self._session_authorized = False
                     self._authorized_at = 0.0
@@ -449,9 +457,9 @@ class LGBot:
                 salvaged = []
                 futs = {self._pool.submit(self.save_bidding_data, [r]): r for r in inventory}
                 for f, r in futs.items():
+                    s_no = r["serial_no"].strip().upper()
                     try:
                         res = f.result()
-                        s_no = r["serial_no"].strip().upper()
                         if self._save_result_ok(res):
                             salvaged.append(r)
                             with self._state_lock:
@@ -459,9 +467,13 @@ class LGBot:
                                 self._dispatched_serials.add(s_no)
                         else:
                             with self._state_lock:
-                                self._booked_serials.add(s_no)
+                                if res and ("ORA-00001" in res or "unique constraint" in res.lower()):
+                                    self._booked_serials.add(s_no)
+                                else:
+                                    self._dispatched_serials.discard(s_no)
                     except Exception:
-                        pass
+                        with self._state_lock:
+                            self._dispatched_serials.discard(s_no)
                 if salvaged:
                     self._report_bookings(salvaged)
                     with self._state_lock:
@@ -855,7 +867,7 @@ class LGBot:
         drop_times = self._parse_drop_times()
         if not drop_times:
             return False, 999999.0, ""
-        now = datetime.now()
+        now = datetime.now(IST)
         start_lead = -DROP_BURST_LEAD_S
         end_tail = DROP_BURST_DURATION_S - DROP_BURST_LEAD_S
 
@@ -883,7 +895,7 @@ class LGBot:
         drop_times = self._parse_drop_times()
         if not drop_times:
             return False
-        now = datetime.now()
+        now = datetime.now(IST)
         for dt_str in drop_times:
             try:
                 parts = [int(p) for p in dt_str.split(":")]
@@ -1238,7 +1250,9 @@ class LGBot:
 
     def _save_result_ok(self, submit_msg: str | None) -> bool:
         """Decide if a SaveBiddingData response is a success or an LG error."""
-        if not submit_msg:
+        if submit_msg is None:
+            return False  # Transport/HTTP/network timeout error
+        if submit_msg == "":
             return True  # empty `d` = success
         return not self.SAVE_ERR.search(submit_msg)
 
@@ -1370,13 +1384,15 @@ class LGBot:
                             salvaged = []
                             futs = {self._pool.submit(self.save_bidding_data, [r]): r for r in inventory}
                             for f, r in futs.items():
+                                s_no = r["serial_no"].strip().upper()
                                 try:
                                     res = f.result()
                                     if self._save_result_ok(res):
                                         salvaged.append(r)
-                                        self._booked_serials.add(r["serial_no"].strip().upper())
+                                        self._booked_serials.add(s_no)
                                     else:
-                                        self._booked_serials.add(r["serial_no"].strip().upper())
+                                        if res and ("ORA-00001" in res or "unique constraint" in res.lower()):
+                                            self._booked_serials.add(s_no)
                                 except Exception:
                                     pass
                             if salvaged:
@@ -1700,41 +1716,47 @@ class LGBot:
                             result = self._submit_authorized(matched, "catchup batch")
                             if result == "session_expired":
                                 # Session died (LG side) — not a booking failure.
-                                # If we have a real grid page we re-run OTP now;
-                                # otherwise next iteration does a full scan + OTP.
+                                # Re-initialize the session to obtain fresh ASP.NET cookies and ViewState
                                 self._session_authorized = False
                                 self._authorized_at = 0.0
-                                _log("warn", "Session expired — re-running full OTP cycle")
-                                if not pages:
-                                    tree_fresh = self.get_initial()
-                                    if tree_fresh is not None:
-                                        tree_fresh = self.search()
-                                    if tree_fresh is not None:
-                                        pages = self.collect_pages(tree_fresh)
+                                _log("warn", "Session expired — refreshing session and re-running full OTP cycle")
+                                tree_fresh = self.get_initial()
+                                if tree_fresh is not None:
+                                    tree_fresh = self.search()
+                                if tree_fresh is not None:
+                                    pages = self.collect_pages(tree_fresh)
                                 if pages:
-                                    result = self._run_full_otp(matched, pages)
-                                    if result == "ok":
-                                        with self._state_lock:
-                                            self.bids_placed += len(matched)
-                                            self.attempted_count += len(matched)
-                                    elif result != "busy":
-                                        with self._state_lock:
-                                            self.failed_count += len(matched)
-                                            self.attempted_count += len(matched)
-                                            for r in matched:
-                                                s_no = r["serial_no"].strip().upper()
-                                                if s_no not in self._booked_serials:
-                                                    self._dispatched_serials.discard(s_no)
-                                        _log("error", f"OTP flow failed for {len(matched)} item(s)")
+                                    unbooked_matched = [
+                                        r for r in matched
+                                        if r["serial_no"].strip().upper() not in self._booked_serials
+                                    ]
+                                    if unbooked_matched:
+                                        result = self._run_full_otp(unbooked_matched, pages)
+                                        if result == "ok":
+                                            with self._state_lock:
+                                                self.bids_placed += len(unbooked_matched)
+                                                self.attempted_count += len(unbooked_matched)
+                                        elif result != "busy":
+                                            with self._state_lock:
+                                                self.failed_count += len(unbooked_matched)
+                                                self.attempted_count += len(unbooked_matched)
+                                                for r in unbooked_matched:
+                                                    s_no = r["serial_no"].strip().upper()
+                                                    if s_no not in self._booked_serials:
+                                                        self._dispatched_serials.discard(s_no)
+                                            _log("error", f"OTP flow failed for {len(unbooked_matched)} item(s)")
+                                        else:
+                                            with self._state_lock:
+                                                for r in unbooked_matched:
+                                                    self._dispatched_serials.discard(r["serial_no"].strip().upper())
                                     else:
-                                        with self._state_lock:
-                                            for r in matched:
-                                                self._dispatched_serials.discard(r["serial_no"].strip().upper())
+                                        _log("info", "All items already booked prior to session expiry")
                                 else:
                                     _log("warn", "Retrying with a full OTP cycle next iteration")
                                     with self._state_lock:
                                         for r in matched:
-                                            self._dispatched_serials.discard(r["serial_no"].strip().upper())
+                                            if r["serial_no"].strip().upper() not in self._booked_serials:
+                                                self._dispatched_serials.discard(r["serial_no"].strip().upper())
                         else:
                             if not pages:
                                 tree_fresh = self.get_initial()
