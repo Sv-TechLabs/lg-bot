@@ -215,19 +215,42 @@ class LGBot:
         if not self.api_url or not self.filter_id:
             return
         _log("info", f"Fetching config for filter {self.filter_id}")
-        resp = httpx.get(
-            f"{self.api_url}/api/bot/filter-profiles/{self.filter_id}",
-            headers={"X-SERVICE-KEY": self.service_key},
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            _log("error", f"Config fetch failed: HTTP {resp.status_code}")
-            sys.exit(1)
+        attempts = 3 if self.iter == 0 else 1
+        resp = None
+        for attempt in range(attempts):
+            try:
+                resp = httpx.get(
+                    f"{self.api_url}/api/bot/filter-profiles/{self.filter_id}",
+                    headers={"X-SERVICE-KEY": self.service_key},
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    break
+            except Exception as e:
+                if attempt == attempts - 1:
+                    _log("warn" if self.iter > 0 else "error", f"Config fetch exception: {e}")
+            if attempt < attempts - 1:
+                time.sleep(1.0)
+
+        if resp is None or resp.status_code != 200:
+            status = resp.status_code if resp is not None else "failed"
+            _log("warn" if self.iter > 0 else "error", f"Config fetch HTTP {status} — using active config")
+            if self.iter == 0:
+                sys.exit(1)
+            return
+
         c = resp.json()
         self.url = c["url"]
         self.min_price = c["priceMin"]
         self.max_price = c["priceMax"]
-        self.dp_percents = set(c.get("dpPercents", []))
+        try:
+            self.dp_percents = {
+                float(str(x).replace("%", "").strip())
+                for x in c.get("dpPercents", [])
+                if x is not None and str(x).strip()
+            }
+        except Exception:
+            self.dp_percents = set()
         self.filter_by_price = c.get("filterByPrice", True)
         self.filter_by_dp = c.get("filterByDp", True)
         self.filter_by_product = bool(c.get("filterByProduct", False))
@@ -318,10 +341,10 @@ class LGBot:
                     "imageUrl": row.get("image_url", ""),
                     "dmgImageUrl": row.get("dmg_image_url", ""),
                     "defect": row.get("defect", ""),
-                    "biddingStart": self._to_iso(row["from_date"]),
-                    "biddingEnd": self._to_iso(row["to_date"]),
-                    "dealerPrice": price(row["dealer_price"]),
-                    "discountPct": price((row["dp"] or "").rstrip("%")),
+                    "biddingStart": self._to_iso(row.get("from_date", "")),
+                    "biddingEnd": self._to_iso(row.get("to_date", "")),
+                    "dealerPrice": price(row.get("dealer_price") or row.get("base_price")),
+                    "discountPct": price(str(row.get("dp") or "").rstrip("%")),
                     "status": "confirmed",
                     "workerId": self.worker_id,
                     "filterId": self.filter_id or "",
@@ -880,9 +903,12 @@ class LGBot:
             except Exception:
                 continue
             diff_s = (drop_dt - now).total_seconds()
+            if diff_s < -DROP_BURST_DURATION_S:
+                drop_dt += timedelta(days=1)
+                diff_s = (drop_dt - now).total_seconds()
             if start_lead <= -diff_s <= end_tail:
                 return True, diff_s, dt_str
-            if abs(diff_s) < abs(best_diff):
+            if diff_s < best_diff:
                 best_diff = diff_s
                 best_target = dt_str
 
@@ -903,6 +929,9 @@ class LGBot:
             except Exception:
                 continue
             diff_s = (drop_dt - now).total_seconds()
+            if diff_s < -DROP_BURST_DURATION_S:
+                drop_dt += timedelta(days=1)
+                diff_s = (drop_dt - now).total_seconds()
             if PREWARM_WINDOW_END_S <= diff_s <= PREWARM_WINDOW_START_S:
                 return True
         return False
@@ -1086,8 +1115,8 @@ class LGBot:
         seen: set[str] = set()
         deduped = []
         for r in rows:
-            key = r["serial_no"]
-            if key in seen:
+            key = (r.get("serial_no") or "").strip().upper()
+            if not key or key in seen:
                 continue
             seen.add(key)
             deduped.append(r)
@@ -1198,18 +1227,18 @@ class LGBot:
                 # stays 420000. A trailing .0 on a whole number is rejected.
                 return int(v) if v.is_integer() else v
             selected.append({
-                "Branch": r["branch"],
-                "Serial_No": r["serial_no"],
-                "Image_Name": r["image_name"],
-                "DmgImage_Name": r["dmg_image"],
-                "ModelCode": r["model_code"],
-                "Product": r["product"],
-                "Disc_Category": r["category"],
-                "Bidding_StartDate": r["from_date"],
-                "Bidding_EndDate": r["to_date"],
-                "Base_Price": num(r["base_price"]),
-                "batchno": r["batchno"],
-                "dp": num(r["dp"]),
+                "Branch": r.get("branch", ""),
+                "Serial_No": r.get("serial_no", ""),
+                "Image_Name": r.get("image_name", ""),
+                "DmgImage_Name": r.get("dmg_image", ""),
+                "ModelCode": r.get("model_code", ""),
+                "Product": r.get("product", ""),
+                "Disc_Category": r.get("category", ""),
+                "Bidding_StartDate": r.get("from_date", ""),
+                "Bidding_EndDate": r.get("to_date", ""),
+                "Base_Price": num(r.get("base_price", "0")),
+                "batchno": r.get("batchno", ""),
+                "dp": num(r.get("dp", "0")),
                 "Created_By": self.ship_to,
                 "Ship_To_Code": self.ship_to,
             })
@@ -1509,10 +1538,6 @@ class LGBot:
             _log("warn", "Cannot pre-warm: no items on grid to trigger OTP email")
             return False
 
-        self._last_prewarm_time = now_mono
-        self._prewarm_attempts += 1
-
-        _log("action", f"Pre-warming session OTP authorization for scheduled drop at {self.drop_time} (attempt {self._prewarm_attempts}/{MAX_PREWARM_ATTEMPTS}) using {sample_row.get('serial_no')}...")
         begin = self._otp_api("begin", {
             "worker_id": self.worker_id,
             "ship_to": self.ship_to,
@@ -1521,8 +1546,13 @@ class LGBot:
             "item_count": 1,
         })
         if not begin or begin.get("status") == "busy":
-            _log("warn", f"Pre-warm OTP lock busy: {begin}")
+            _log("info", f"Pre-warm OTP lock busy (another worker holds lock) — will retry in 5s: {begin}")
+            self._last_prewarm_time = now_mono - PREWARM_COOLDOWN_S + 5.0
             return False
+
+        self._last_prewarm_time = now_mono
+        self._prewarm_attempts += 1
+        _log("action", f"Pre-warming session OTP authorization for scheduled drop at {self.drop_time} (attempt {self._prewarm_attempts}/{MAX_PREWARM_ATTEMPTS}) using {sample_row.get('serial_no')}...")
         req_id = begin.get("otp_request_id")
         if not req_id:
             return False
@@ -1809,8 +1839,8 @@ class LGBot:
                 sleep = 0.0
             else:
                 has_pending = bool(
-                    self._cached_inventory
-                    and any(r["serial_no"].strip().upper() not in self._booked_serials for r in self._cached_inventory)
+                    matched
+                    and any(r["serial_no"].strip().upper() not in self._booked_serials for r in matched)
                 )
                 if has_pending:
                     sleep = 0.0
