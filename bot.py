@@ -42,7 +42,7 @@ PREWARM_COOLDOWN_S = float(os.environ.get("PREWARM_COOLDOWN_S", "180.0"))       
 MAX_PREWARM_ATTEMPTS = int(os.environ.get("MAX_PREWARM_ATTEMPTS", "2"))
 # Precision drop bursting (burst polling at drop time)
 DROP_BURST_ENABLED = os.environ.get("DROP_BURST_ENABLED", "1") == "1"
-DROP_TIME = os.environ.get("DROP_TIME", "20:31:00")  # HH:MM:SS format (IST)
+DROP_TIME = os.environ.get("DROP_TIME", "18:31:00,20:31:00")  # HH:MM:SS format (IST), supports comma-separated drop times
 DROP_BURST_LEAD_S = float(os.environ.get("DROP_BURST_LEAD_S", "3.0"))  # Start burst N seconds before drop
 DROP_BURST_DURATION_S = float(os.environ.get("DROP_BURST_DURATION_S", "10.0"))  # Total burst window duration
 DROP_BURST_INTERVAL_S = float(os.environ.get("DROP_BURST_INTERVAL_S", "0.05"))  # 50ms interval during burst
@@ -571,21 +571,24 @@ class LGBot:
         if not matched:
             return []
 
-        with self._state_lock:
-            for r in matched:
-                s = r["serial_no"].strip().upper()
-                self._dispatched_serials.add(s)
-                self._detected_serials.add(s)
-            self.detected_count = len(self._detected_serials)
-
         tag = f"[{source_label}] " if source_label else ""
         _log("detect", f"{tag}Detected {len(matched)} actionable match(es): {', '.join(r['serial_no'] for r in matched)}")
 
         if self._session_authorized:
+            with self._state_lock:
+                for r in matched:
+                    s = r["serial_no"].strip().upper()
+                    self._dispatched_serials.add(s)
+                    self._detected_serials.add(s)
+                self.detected_count = len(self._detected_serials)
             _log("action", f"{tag}Session pre-authorized — dispatching {len(matched)} match(es) immediately to SaveBiddingData in background!")
             fut = self._pool.submit(self._submit_authorized, matched, source_label)
             self._active_booking_futs.append(fut)
         else:
+            with self._state_lock:
+                for r in matched:
+                    self._detected_serials.add(r["serial_no"].strip().upper())
+                self.detected_count = len(self._detected_serials)
             _log("info", f"{tag}Session not yet pre-authorized — queued {len(matched)} match(es) for primary OTP submission")
 
         return matched
@@ -838,36 +841,59 @@ class LGBot:
         except Exception:
             return src
 
-    def _check_drop_burst(self) -> tuple[bool, float]:
-        """Check if current time is inside the drop burst window. Returns (is_burst, diff_seconds)."""
-        if not self.drop_burst_enabled or not self.drop_time:
-            return False, 999999.0
+    def _parse_drop_times(self) -> list[str]:
+        if not self.drop_time:
+            return []
+        if isinstance(self.drop_time, (list, tuple)):
+            return list(self.drop_time)
+        return [t.strip() for t in str(self.drop_time).split(",") if t.strip()]
+
+    def _check_drop_burst(self) -> tuple[bool, float, str]:
+        """Check if current time is inside the drop burst window for any drop time. Returns (is_burst, min_diff_seconds, target_drop_time)."""
+        if not self.drop_burst_enabled:
+            return False, 999999.0, ""
+        drop_times = self._parse_drop_times()
+        if not drop_times:
+            return False, 999999.0, ""
         now = datetime.now()
-        try:
-            parts = [int(p) for p in self.drop_time.split(":")]
-            drop_dt = now.replace(hour=parts[0], minute=parts[1], second=parts[2], microsecond=0)
-        except Exception:
-            return False, 999999.0
-        diff_s = (drop_dt - now).total_seconds()
         start_lead = -DROP_BURST_LEAD_S
         end_tail = DROP_BURST_DURATION_S - DROP_BURST_LEAD_S
-        is_burst = (start_lead <= -diff_s <= end_tail)
-        return is_burst, diff_s
+
+        best_diff = 999999.0
+        best_target = ""
+        for dt_str in drop_times:
+            try:
+                parts = [int(p) for p in dt_str.split(":")]
+                drop_dt = now.replace(hour=parts[0], minute=parts[1], second=parts[2], microsecond=0)
+            except Exception:
+                continue
+            diff_s = (drop_dt - now).total_seconds()
+            if start_lead <= -diff_s <= end_tail:
+                return True, diff_s, dt_str
+            if abs(diff_s) < abs(best_diff):
+                best_diff = diff_s
+                best_target = dt_str
+
+        return False, best_diff, best_target
 
     def _is_prewarm_window(self) -> bool:
-        """Check if current time is inside the pre-warm window before drop time (default: 8 to 1 mins before drop)."""
-        if not self.prewarm or not self.drop_time:
+        """Check if current time is inside the pre-warm window before any scheduled drop time."""
+        if not self.prewarm:
+            return False
+        drop_times = self._parse_drop_times()
+        if not drop_times:
             return False
         now = datetime.now()
-        try:
-            parts = [int(p) for p in self.drop_time.split(":")]
-            drop_dt = now.replace(hour=parts[0], minute=parts[1], second=parts[2], microsecond=0)
-        except Exception:
-            return False
-        diff_s = (drop_dt - now).total_seconds()
-        # Pre-warm only within [PREWARM_WINDOW_END_S, PREWARM_WINDOW_START_S] before drop
-        # E.g. between 20:23:00 and 20:30:00 for a 20:31:00 drop
-        return PREWARM_WINDOW_END_S <= diff_s <= PREWARM_WINDOW_START_S
+        for dt_str in drop_times:
+            try:
+                parts = [int(p) for p in dt_str.split(":")]
+                drop_dt = now.replace(hour=parts[0], minute=parts[1], second=parts[2], microsecond=0)
+            except Exception:
+                continue
+            diff_s = (drop_dt - now).total_seconds()
+            if PREWARM_WINDOW_END_S <= diff_s <= PREWARM_WINDOW_START_S:
+                return True
+        return False
 
     def _warmup_connections(self) -> None:
         """Pre-warm HTTP/2 connection pool before drop time to eliminate TLS handshake latency."""
@@ -1547,9 +1573,9 @@ class LGBot:
             # Precision drop burst & connection arming
             in_burst = False
             if self.drop_burst_enabled:
-                in_burst, diff_s = self._check_drop_burst()
+                in_burst, diff_s, burst_target = self._check_drop_burst()
                 if in_burst:
-                    _log("action", f"🔥 DROP BURST ACTIVE ({diff_s:+.2f}s from {self.drop_time}) — scanning at {DROP_BURST_INTERVAL_S*1000:.0f}ms frequency!")
+                    _log("action", f"🔥 DROP BURST ACTIVE ({diff_s:+.2f}s from {burst_target}) — scanning at {DROP_BURST_INTERVAL_S*1000:.0f}ms frequency!")
                 elif 1.0 <= diff_s <= 15.0 and not self._connections_warmed:
                     _log("action", f"⚡ ARMING TCP: Drop in {diff_s:.1f}s — pre-warming HTTP connection pool...")
                     self._warmup_connections()
